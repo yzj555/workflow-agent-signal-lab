@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": { "types": ["node", "react", "react-dom"] },
+  "files": ["src/client/runtime.ts", "src/client/workflow-source.ts", "src/client/workflow-display.ts"]
+}

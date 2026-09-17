@@ -1,0 +1,21 @@
+# Development template only; this file is not loaded by the live profile.
+# Make a local cordis.patch.yml and set an absolute, private data directory.
+# The placeholder is intentionally NOT absolute: leaving it unchanged must fail.
+# Keep the official profile's settings, credentials and other plugins unchanged.
+- insert:
+    - id: workflow-agent-signal-lab-ui
+      name: '@local/workflow-agent-signal-lab'
+
+    - id: workflow-agent-runtime
+      name: '@local/workflow-agent-signal-lab/workflow-engine'
+      config:
+        dataDirectory: REPLACE_WITH_ABSOLUTE_PRIVATE_DATA_DIRECTORY
+        rootTurnNoProgressMs: 180000
+        rootRecoveryNoProgressMs: 120000
+        rootCancelGraceMs: 15000
+        userWaitProbeMs: 30000
+        childAdmissionMs: 30000
+        childNoProgressMs: 180000
+        childMaxRunMs: 1200000
+        childReportGraceMs: 15000
+        childCancelGraceMs: 15000
