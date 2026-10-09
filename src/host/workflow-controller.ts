@@ -5,6 +5,8 @@ import type { AskUserQuestionItem } from '@deepseek-ai/dsh-user-questions'
 import type { ToolDispatchExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { WorkflowCommandRuntime, resolveCommandConfig } from './workflow-command-runtime.ts'
 import { WorkflowRunTime } from './workflow-run-time.ts'
+import { WorkflowHostAdmission, HostAdmissionFull, collectHostRoleClaims, hostRoleKey } from './workflow-host-admission.ts'
+import type { HostAdmissionConfig } from './workflow-host-admission.ts'
 import { resolveRunBudgetEnabled, resolveRunBudgetLimits, resolveRunBudgetScope, RunBudgetExceeded, RUN_BUDGET_STOP_MESSAGE,
   CONTROL_REQUESTS_PER_TURN, budgetRecoveryInputSchema, runTimeSummary } from '../workflow-run-budget.ts'
 import { assertBudgetAction, budgetQuestion } from '../workflow-budget-recovery.ts'
@@ -12,8 +14,10 @@ import type { RunBudgetConfig, RunBudgetLimits, RunBudgetResource, RunBudgetScop
 import type { CommandRuntimeConfig } from './workflow-command-runtime.ts'
 import { z } from 'zod'
 import { WorkflowJournalError } from '../workflow-journal.ts'
+import { JOURNAL_CAPACITY_MESSAGE } from '../workflow-journal-capacity.ts'
 import type { WorkflowJournal } from '../workflow-journal.ts'
 import type { WorkflowSnapshot } from '../workflow-view.ts'
+import { workflowFailedRoles } from '../workflow-view.ts'
 import type { ArtifactRecord, TaskBrief, WorkflowRecord, WorkflowRole, WorkflowStage } from '../workflow-contract.ts'
 import { WORKFLOW_STAGES, currentTaskBriefs, parseWorkflowRecord, planTaskWaves } from '../workflow-contract.ts'
 import {
@@ -76,7 +80,7 @@ import {
 import type { ActiveLearningRule, LearningCommand, LearningRevisionCommand, LearningScope, WorkflowExecutionProfile } from '../workflow-learning.ts'
 import type { WorkflowTextArtifacts } from './workflow-artifacts.ts'
 import {
-  beginWorkspaceRestore, captureWorkspaceFileState, snapshotWorkspaceFile, verifyWorkspaceArtifact,
+  assertWorkspaceMutationSize, beginWorkspaceRestore, captureWorkspaceFileState, snapshotWorkspaceFile, verifyWorkspaceArtifact,
 } from './workflow-artifacts.ts'
 import type { WorkspaceRestoreEntry } from './workflow-artifacts.ts'
 import { applyDurableRollback, cleanDurableRollback, inspectDurableRollback } from './workflow-rollback.ts'
@@ -98,7 +102,7 @@ export interface WorkflowDriver {
   ensureRootDurable(agent: Agent, signal: AbortSignal): Promise<void>
   /** Native question observation supplied by the Host; never model-declared. */
   isAwaitingUser?(agent: Agent): boolean
-  cancelRoot?(agent: Agent): void
+  cancelRoot?(agent: Agent, reason?: 'run-budget' | 'journal-capacity' | 'storage-unavailable' | 'host-resources'): void
   ask(agent: Agent, questions: readonly AskUserQuestionItem[], signal: AbortSignal): Promise<unknown>
   start(parent: Agent, childId: string, role: Exclude<WorkflowRole, 'pm'>, prompt: string, signal: AbortSignal): Promise<void>
   resume(parent: Agent, childId: string, prompt: string, signal: AbortSignal): Promise<void>
@@ -203,6 +207,10 @@ export class WorkflowTextController {
   readonly runBudgetLimits: RunBudgetLimits
   readonly runBudgetEnabled: boolean
   readonly runBudgetScope: RunBudgetScope
+  readonly hostAdmission: WorkflowHostAdmission
+  private readonly rootModelScopes = new Set<Agent>()
+  private readonly hostPaused = new WeakMap<Agent, number>()
+  private readonly hostTurns = new WeakMap<Agent, number>()
   private readonly roots = new WeakSet<Agent>()
   private readonly rootObservers = new Set<(agent: Agent) => void>()
   private readonly queues = new Map<string, Promise<void>>()
@@ -212,6 +220,11 @@ export class WorkflowTextController {
   private readonly questions = new Map<Agent, AbortController>()
   private readonly stopped = new Set<string>()
   private readonly timedRoots = new Map<string, { root: Agent; runId: string }>()
+  private readonly capacityRoots = new Map<string, WeakRef<Agent>>()
+  private readonly capacitySealed = new WeakSet<Agent>()
+  private readonly unsubscribeCapacity: () => void
+  private readonly unsubscribeFault: () => void
+  private storageSealed = false
   readonly runTime: WorkflowRunTime
   private readonly budgetTurns = new WeakMap<Agent, { runId: string; authorized: boolean; calls: number; closedAtStart: boolean; mode: 'control' | 'resume' }>()
   private closed = false
@@ -230,7 +243,9 @@ export class WorkflowTextController {
     private readonly childClock: ChildWatchdogScheduler = childScheduler(),
     commandConfig: Partial<CommandRuntimeConfig> = {},
     runBudgetConfig: Partial<RunBudgetConfig> = {},
+    hostAdmissionConfig: Partial<HostAdmissionConfig> = {},
   ) {
+    this.hostAdmission = new WorkflowHostAdmission(hostAdmissionConfig, () => collectHostRoleClaims(journal.readAllRunStates()))
     this.runBudgetLimits = resolveRunBudgetLimits(runBudgetConfig)
     this.runBudgetEnabled = resolveRunBudgetEnabled(runBudgetConfig)
     this.runBudgetScope = resolveRunBudgetScope(runBudgetConfig)
@@ -239,8 +254,18 @@ export class WorkflowTextController {
     this.commands = new WorkflowCommandRuntime(resolveCommandConfig(commandConfig), childClock)
     this.runTime = new WorkflowRunTime(journal, (rootId, runId, error) => {
       const entry = this.timedRoots.get(rootId)
-      if (entry?.runId === runId) this.sealBudgetRun(entry.root, runId, error)
+      if (entry?.runId === runId) {
+        if (this.journal.readFault()) this.sealStorageFault()
+        else if (error instanceof WorkflowJournalError && (error.code === 'capacity'
+          || (error.code === 'limit' && this.journal.readSnapshot(rootId).capacity))) this.sealCapacity(entry.root)
+        else this.sealBudgetRun(entry.root, runId, error)
+      }
     }, reportError, childClock)
+    this.unsubscribeCapacity = journal.subscribe(snapshot => {
+      const root = this.capacityRoots.get(snapshot.rootSessionId)?.deref()
+      if (root && snapshot.capacity) this.sealCapacity(root)
+    })
+    this.unsubscribeFault = journal.onFault(() => this.sealStorageFault())
   }
 
   private logRuntimeError(error: unknown): void {
@@ -248,6 +273,7 @@ export class WorkflowTextController {
   }
 
   private assertRunBudget(root: Agent): void {
+    this.assertCapacity(root)
     const run = this.journal.readSnapshot(root.id).run
     const budget = run?.budget
     if (budget?.blocked || budget?.recovery?.awaitingResume) throw new RunBudgetExceeded()
@@ -255,6 +281,7 @@ export class WorkflowTextController {
   }
 
   private async enterRunTime(root: Agent, runId: string, actor: string): Promise<void> {
+    this.assertCapacity(root)
     this.timedRoots.set(root.id, { root, runId })
     await this.runTime.enter(root.id, runId, actor, this.driver.isAwaitingUser?.(root) ?? false)
   }
@@ -263,8 +290,77 @@ export class WorkflowTextController {
   }
   observeRunTimeDisposed(root: Agent): void {
     if (this.timedRoots.get(root.id)?.root === root) this.runTime.leave(root.id, 'root')
+    if (this.capacityRoots.get(root.id)?.deref() === root) this.capacityRoots.delete(root.id)
+  }
+  private assertCapacity(root: Agent): void {
+    try { this.journal.assertExecutionCapacity(root.id) }
+    catch (error) {
+      if (error instanceof WorkflowJournalError && error.code === 'capacity') this.sealCapacity(root)
+      throw error
+    }
+  }
+  private async askCurrent(root: Agent, questions: readonly AskUserQuestionItem[], signal: AbortSignal): Promise<unknown> {
+    // A gate-request commit can itself cross the high-water mark before the
+    // question is registered. Do not show an approval that can no longer apply.
+    this.assertCapacity(root)
+    signal.throwIfAborted()
+    const answer = await this.driver.ask(root, questions, signal)
+    this.assertCapacity(root)
+    return answer
+  }
+  /** A shared Journal fault revokes all owned execution, without reading or rewriting failed storage. */
+  private sealStorageFault(): void {
+    if (this.closed || this.storageSealed) return
+    this.storageSealed = true
+    const reason = new Error('工作流持久状态无法确认；新执行已封闭，停止请求不等于退出证据。')
+    const roots = new Set<Agent>()
+    for (const ref of this.capacityRoots.values()) {
+      const root = ref.deref()
+      if (root && this.isBoundRoot(root)) roots.add(root)
+    }
+    const leases = [...this.leases.values()].filter(lease => lease.active)
+    for (const lease of leases) { lease.active = false; this.childWatchdog.forget(lease); roots.add(lease.root) }
+    for (const root of roots) this.stopped.add(root.id)
+    for (const lease of leases) lease.admission.abort(reason)
+    for (const root of roots) {
+      this.questions.get(root)?.abort(reason)
+      this.runTime.halt(root.id)
+      if (this.isBoundRoot(root)) {
+        try { this.driver.cancelRoot?.(root, 'storage-unavailable') } catch (error) { this.logRuntimeError(error) }
+      }
+    }
+    // Actual drain proceeds even though no new Journal observation can be
+    // committed. Cold recovery must still treat the old running rows as unknown.
+    for (const lease of leases) this.trackRecovery((async () => {
+      if (!await withinChildGrace(this.drainLease(lease), this.childWatchdog.config.childCancelGraceMs, this.childClock)) {
+        this.logRuntimeError(new Error('存储异常后执行范围未确认回收；保留现场，不能声明已停止。'))
+      }
+    })())
+  }
+  /** Synchronous revocation; only real drain/command observations may claim exit. */
+  private sealCapacity(root: Agent): void {
+    if (!this.isBoundRoot(root) || this.capacitySealed.has(root)) return
+    this.capacitySealed.add(root)
+    this.stopped.add(root.id)
+    this.questions.get(root)?.abort(new Error(JOURNAL_CAPACITY_MESSAGE))
+    this.runTime.halt(root.id)
+    for (const lease of this.leases.values()) {
+      if (lease.root === root && lease.active) this.interruptChild(lease, 'stop-requested', 0, 0, 'Host 因日志容量上限封闭新执行。')
+    }
+    try { this.driver.cancelRoot?.(root, 'journal-capacity') } catch (error) { this.logRuntimeError(error) }
+  }
+
+  /** A full legacy row may lack room even for exit observations; isolate it, never fabricate them. */
+  private async recoverWithinCapacity(rootId: string, work: () => Promise<unknown>): Promise<void> {
+    try { await work() }
+    catch (error) {
+      if (!(error instanceof WorkflowJournalError) || !['capacity', 'limit'].includes(error.code)
+        || !this.journal.readSnapshot(rootId).capacity) throw error
+      this.logRuntimeError(new Error('旧会话日志容量不足，无法补写恢复观察；保留原记录与未确认退出状态，新执行已封闭。', { cause: error }))
+    }
   }
   private sealBudgetRun(root: Agent, runId: string, error: Error): void {
+    if (this.journal.readFault()) { this.sealStorageFault(); return }
     this.stopped.add(root.id)
     this.questions.get(root)?.abort(error)
     this.runTime.halt(root.id)
@@ -281,6 +377,7 @@ export class WorkflowTextController {
   observeBudgetTurn(agent: Agent, event: { readonly type: string; readonly data?: unknown }): void {
     if (this.closed || !this.isBoundRoot(agent)) return
     if (event.type === 'turn/start') {
+      this.hostTurns.set(agent, (this.hostTurns.get(agent) ?? 0) + 1)
       this.budgetTurns.delete(agent)
       const run = this.journal.readSnapshot(agent.id).run
       if (run?.budget?.blocked || run?.budget?.recovery?.awaitingResume) this.budgetTurns.set(agent, {
@@ -290,6 +387,10 @@ export class WorkflowTextController {
     } else if (event.type === 'user/message') {
       const turn = this.budgetTurns.get(agent)
       const data = event.data as { source?: { kind?: unknown } } | undefined
+      const pausedAt = this.hostPaused.get(agent)
+      if (data?.source?.kind === 'user' && pausedAt !== undefined && (this.hostTurns.get(agent) ?? 0) > pausedAt) {
+        this.hostPaused.delete(agent)
+      }
       if (turn && data?.source?.kind === 'user') turn.authorized = true
     } else if (event.type === 'turn/end') { this.budgetTurns.delete(agent); this.runTime.leave(agent.id, 'root') }
   }
@@ -297,7 +398,9 @@ export class WorkflowTextController {
   isBudgetControlTurn(root: Agent): boolean { return this.budgetTurns.has(root) }
 
   rootModelTools(root: Agent): readonly string[] {
-    const run = this.journal.readSnapshot(root.id).run
+    const snapshot = this.journal.readSnapshot(root.id)
+    if (snapshot.capacity) return ['workflow_status', 'workflow_stop']
+    const run = snapshot.run
     const turn = this.budgetTurns.get(root)
     // DSH assembles schemas BEFORE appending claimed user messages. Projection
     // may prepare the resumed schema, but model admission and execution guards
@@ -311,6 +414,7 @@ export class WorkflowTextController {
   private async consumeBudget(root: Agent, runId: string, resource: RunBudgetResource): Promise<void> {
     try { await this.journal.consumeRunBudget(root.id, runId, resource) }
     catch (error) {
+      if (error instanceof WorkflowJournalError && error.code === 'capacity') { this.sealCapacity(root); throw error }
       if (!(error instanceof RunBudgetExceeded)
         && !(error instanceof WorkflowJournalError && error.code === 'recovery-required')) throw error
       // Accounting I/O failure is fail-closed as well. Never dispatch while
@@ -321,6 +425,42 @@ export class WorkflowTextController {
   }
 
   /** Called by the exact Agent-scope LLM waterfall before provider dispatch. */
+  private assertHostResumed(root: Agent): void {
+    if (this.hostPaused.has(root)) throw new Error('本会话因 Host 并发不足暂停；旧响应或后台通知不会重试。名额释放后，请在原生输入框发起一条新消息再决定推进；/workflow-resources 无需模型可查看。')
+  }
+
+  private reserveHostRoles(root: Agent, keys: readonly string[]): () => void {
+    this.assertHostResumed(root)
+    try { return this.hostAdmission.reserveRoles(root.id, keys) }
+    catch (error) {
+      if (error instanceof HostAdmissionFull) this.hostPaused.set(root, this.hostTurns.get(root) ?? 0)
+      throw error
+    }
+  }
+
+  beginHostModel(agent: Agent): () => void {
+    const lease = this.leases.get(agent.id)
+    if (lease) {
+      if (lease.child !== agent) throw new Error('模型请求未绑定到本次子 Agent 实例')
+      this.assertLease(lease) // Its full execution is already a durable role slot.
+      return () => {}
+    }
+    const root = this.root(agent)
+    this.assertCapacity(root)
+    this.assertHostResumed(root)
+    let release: () => void
+    try { release = this.hostAdmission.beginRootModel(root.id) }
+    catch (error) {
+      if (error instanceof HostAdmissionFull) this.hostPaused.set(root, this.hostTurns.get(root) ?? 0)
+      throw error
+    }
+    if (!this.hostAdmission.config.hostAdmissionEnabled) return release
+    this.rootModelScopes.add(root)
+    let settled = false
+    return () => { if (!settled) { settled = true; this.rootModelScopes.delete(root); release() } }
+  }
+
+  /** Durable request counts are separate from Host-wide simultaneous occupancy. */
   async admitModelRequest(agent: Agent): Promise<void> {
     const lease = this.leases.get(agent.id)
     if (lease) {
@@ -331,6 +471,7 @@ export class WorkflowTextController {
       this.assertLease(lease)
     } else {
       const root = this.root(agent)
+      this.assertCapacity(root)
       const run = this.journal.readSnapshot(root.id).run
       if (!run) return // Requirement ingress has a separate root-turn watchdog.
       const turn = this.budgetTurns.get(root)
@@ -473,10 +614,10 @@ export class WorkflowTextController {
       if (this.journal.readSnapshot(rootId).run?.runId !== state.runId) continue
       const time = this.journal.readRunBudget(rootId, state.runId)?.time
       if (time?.reservedMs && time.ownerId !== this.runTime.ownerId) {
-        await this.journal.recoverRunTime(rootId, state.runId, this.runTime.ownerId)
+        await this.recoverWithinCapacity(rootId, () => this.journal.recoverRunTime(rootId, state.runId, this.runTime.ownerId))
       }
       const pending = this.journal.readRunBudget(rootId, state.runId)?.recovery?.requests.find(item => item.status === 'pending')
-      if (pending) await this.journal.settleBudgetRecovery(rootId, state.runId, pending.id, 'cancelled')
+      if (pending) await this.recoverWithinCapacity(rootId, () => this.journal.settleBudgetRecovery(rootId, state.runId, pending.id, 'cancelled'))
     }
     for (const state of this.journal.readAllRunStates()) {
       if (!state.created || state.manualClose) continue
@@ -499,8 +640,8 @@ export class WorkflowTextController {
       }
       if (events.length) {
         const rootSessionId = state.created.rootSessionId
-        await this.serial(rootSessionId, () => this.journal.commit({ rootSessionId,
-          expectedRevision: this.journal.readSnapshot(rootSessionId).revision, events }))
+        await this.recoverWithinCapacity(rootSessionId, () => this.serial(rootSessionId, () => this.journal.commit({ rootSessionId,
+          expectedRevision: this.journal.readSnapshot(rootSessionId).revision, events })))
       }
     }
   }
@@ -509,6 +650,8 @@ export class WorkflowTextController {
   bindRoot(agent: Agent): void {
     if (this.closed || !this.driver.isRoot(agent)) throw new Error('工作流模式未绑定到有效的原生根 Agent')
     this.roots.add(agent)
+    this.capacityRoots.set(agent.id, new WeakRef(agent))
+    if (this.journal.readSnapshot(agent.id).capacity) this.sealCapacity(agent)
     for (const observer of this.rootObservers) {
       try { observer(agent) } catch (error) { this.reportError(error) }
     }
@@ -583,8 +726,10 @@ export class WorkflowTextController {
         }
       } else {
         const root = this.root(agent)
+        if (!['workflow_status', 'workflow_stop'].includes(tool)) this.assertCapacity(root)
         if (!this.rootModelTools(root).includes(tool)) throw new Error('预算核对期间只能查看、申请补额或结束；不能执行工作流、自动重试或绕过预算')
-        if (!['workflow_status', 'workflow_budget', 'workflow_reconcile', 'workflow_propose'].includes(tool)) this.assertRunBudget(root)
+        if (!['workflow_status', 'workflow_budget', 'workflow_reconcile', 'workflow_propose'].includes(tool)
+          && !(tool === 'workflow_stop' && this.journal.readSnapshot(root.id).capacity)) this.assertRunBudget(root)
         if (!ROOT_TOOLS.some(name => name === tool)) throw new Error('协调 Agent 仅可使用工作流控制工具；文件与检查能力只授予匹配任务包的子角色')
       }
       return undefined
@@ -793,7 +938,8 @@ export class WorkflowTextController {
       for (const gate of Object.values(state.gates).filter(item => item.kind === 'rollback' && item.status === 'waiting')) {
         events.push(this.event(state.runId, 'gate/decided', { gateId: gate.gateId, decision: 'cancelled', reason: 'Host 重启，旧撤销回答不可复用' }))
       }
-      if (events.length) await this.journal.commit({ rootSessionId: rootId, expectedRevision: this.journal.readSnapshot(rootId).revision, events })
+      if (events.length) await this.recoverWithinCapacity(rootId, () => this.journal.commit({ rootSessionId: rootId,
+        expectedRevision: this.journal.readSnapshot(rootId).revision, events }))
     }
   }
 
@@ -878,7 +1024,7 @@ export class WorkflowTextController {
     const root = this.root(agent)
     return this.serial(root.id, async () => {
       const { snapshot, state } = this.current(root)
-      if (state?.manualClose || snapshot.run?.budget?.blocked) return { kind: 'needs-attention' }
+      if (snapshot.capacity || state?.manualClose || snapshot.run?.budget?.blocked) return { kind: 'needs-attention' }
       if (this.isAwaitingUser(root)) return { kind: 'needs-attention' }
       const runRecovery = state?.runtimeRecovery
       const preRunRecovery = snapshot.preRunRecovery ?? undefined
@@ -923,7 +1069,7 @@ export class WorkflowTextController {
         preserved,
         resumeFrom,
       })])
-      if (!autoContinue) return { kind: 'needs-attention', incidentId }
+      if (!autoContinue || committed.capacity) return { kind: 'needs-attention', incidentId }
       const prompt = [
         '【Workflow Runtime 自动恢复】',
         reason,
@@ -1042,6 +1188,8 @@ export class WorkflowTextController {
       : '以 snapshot.revision 调用下一步；授权必须来自 workflow_confirm 对应的 DSH 原生问答结果，模型转述不构成授权。'
     return {
       mode: contract?.profile ?? 'uninitialized', snapshot, recoveryRequired: unknown,
+      hostResources: { ...this.hostAdmission.view(), nativeCommand: '/workflow-resources', automaticQueue: false,
+        currentRootPaused: this.hostPaused.has(root) },
       commandExecutions: Object.values(state?.commands ?? {}),
       ...(reconciliation ? { reconciliation } : {}),
       budgetRecovery: snapshot.run?.budget ? {
@@ -1051,7 +1199,8 @@ export class WorkflowTextController {
         awaitingResume: snapshot.run.budget.recovery?.awaitingResume ?? false,
         nativeCommand: '/workflow-budget',
       } : null,
-      hint: snapshot.run?.budget?.recovery?.closed ? '本轮已通过原生预算门禁结束；历史保留。新任务需用户另起一条原生消息并重新确认。'
+      hint: snapshot.capacity ? JOURNAL_CAPACITY_MESSAGE + ' 无需模型的核对入口：/workflow-capacity。'
+        : snapshot.run?.budget?.recovery?.closed ? '本轮已通过原生预算门禁结束；历史保留。新任务需用户另起一条原生消息并重新确认。'
         : snapshot.run?.budget?.recovery?.awaitingResume ? '补额已保存，但仍未恢复执行；等待用户下一条原生消息。'
         : snapshot.run?.budget?.blocked ? RUN_BUDGET_STOP_MESSAGE : state?.manualClose
         ? '本轮已通过原生门禁人工结束（ABANDONED）。核实陈述与处置记录保留，Host 未证明旧执行范围退出。不得续跑、自动重试、改写为已取消或通过；新目标需重新确认，不自动触发沉淀。'
@@ -1223,7 +1372,7 @@ export class WorkflowTextController {
     })
     const combined = AbortSignal.any([signal, questionAbort.signal])
     try {
-      const answer = await this.driver.ask(root, [{
+      const answer = await this.askCurrent(root, [{
         id: prepared.gateId,
         question: prepared.card.question,
         header: prepared.card.header,
@@ -1268,6 +1417,7 @@ export class WorkflowTextController {
 
   async advance(agent: Agent, input: unknown, signal: AbortSignal): Promise<object> {
     const root = this.root(agent)
+    this.assertHostResumed(root)
     this.assertRunBudget(root)
     const { expectedRevision } = revisionSchema.parse(input)
     return this.serial(root.id, () => this.workspaceSerial(async () => {
@@ -1275,6 +1425,7 @@ export class WorkflowTextController {
       let { snapshot, state } = this.run(root, expectedRevision)
       if (state.outcome || this.stopped.has(root.id)) throw new Error('当前运行已停止或结束')
       if (Object.values(state.assignments).some(item => item.runtimeIssue)) throw new Error('存在子 Agent 运行中断记录；先检查并停止本轮，再重新确认需求，禁止自动续跑')
+      if (snapshot.run && workflowFailedRoles(snapshot.run).length) throw new Error('存在未正常完成的角色报告；先核对原生调用错误并停止本轮，重新确认需求后再执行，不能把运行异常作为业务返工')
       const running = Object.values(state.assignments).filter(item => item.status === 'running')
       if (running.some(item => !this.leases.get(item.agentSessionId)?.active)) throw new Error('运行记录没有当前 Host 的派发凭据，需检查恢复；禁止自动续跑')
       if (running.length) return { snapshot, waiting: true, next: '等待控制层落盘后的角色结束通知；不要循环轮询或新建替代 Agent。' }
@@ -1341,7 +1492,9 @@ export class WorkflowTextController {
       }
       const priorChild = this.leases.get(childId)?.child
       if (priorChild && this.driver.isLive(priorChild)) lease.child = priorChild
-      snapshot = await this.commit(root, snapshot, events)
+      const releaseSlots = this.reserveHostRoles(root, [hostRoleKey(root.id, state.runId, assignmentId, task.version)])
+      try { snapshot = await this.commit(root, snapshot, events) }
+      finally { releaseSlots() }
       this.leases.set(childId, lease)
       this.childWatchdog.watch(lease, lease.role)
       const admissionSignal = AbortSignal.any([signal, lease.admission.signal])
@@ -1575,7 +1728,10 @@ export class WorkflowTextController {
       leases.push(lease)
     }
     signal.throwIfAborted()
-    snapshot = await this.commit(root, snapshot, events)
+    const releaseSlots = this.reserveHostRoles(root,
+      leases.map(lease => hostRoleKey(root.id, lease.runId, lease.assignmentId, lease.taskVersion)))
+    try { snapshot = await this.commit(root, snapshot, events) }
+    finally { releaseSlots() }
     for (const lease of leases) { this.leases.set(lease.childId, lease); this.childWatchdog.watch(lease, lease.role) }
 
     const admitted: Lease[] = []
@@ -1628,13 +1784,7 @@ export class WorkflowTextController {
       const path = normalizeProjectRelative(relative(root, target).replaceAll('\\', '/'), false)
       const checkpointId = `${lease.taskId}@${String(lease.taskVersion)}`
       const current = await captureWorkspaceFileState(contract.workspaceRoot, path)
-      if (current.state.kind === 'file') {
-        if (!current.content) throw new Error(`无法读取检查点内容：${path}`)
-        const stored = await this.artifacts.putCheckpoint(current.content)
-        if (stored.digest !== current.state.digest || stored.bytes !== current.state.bytes) {
-          throw new Error(`检查点内容摘要不一致：${path}`)
-        }
-      }
+      assertWorkspaceMutationSize(name, args, current)
       const checkpoint = state.checkpoints[checkpointId]
       const existing = checkpoint?.files[path.toLocaleLowerCase('en-US')]
       if (existing) {
@@ -1648,6 +1798,17 @@ export class WorkflowTextController {
         if (bytes + (current.state.kind === 'file' ? current.state.bytes : 0) > MAX_CHECKPOINT_BYTES) {
           throw new Error('单次实现检查点的原始文件总量超过 64 MiB；拒绝在无法保证撤销的情况下继续写入')
         }
+      }
+      // Check capacity and external drift before creating any immutable blob.
+      // Repeated edits still retain the immediate before-call image for error compensation.
+      if (current.state.kind === 'file') {
+        if (!current.content) throw new Error(`无法读取检查点内容：${path}`)
+        const stored = await this.artifacts.putCheckpoint(current.content)
+        if (stored.digest !== current.state.digest || stored.bytes !== current.state.bytes) {
+          throw new Error(`检查点内容摘要不一致：${path}`)
+        }
+      }
+      if (!existing) {
         const snapshot = this.journal.readSnapshot(lease.root.id)
         await this.commit(lease.root, snapshot, [this.event(state.runId, 'checkpoint/file-captured', {
           checkpointId, taskId: lease.taskId, taskVersion: lease.taskVersion, path, before: current.state,
@@ -1719,6 +1880,7 @@ export class WorkflowTextController {
     const canonical = resolveProjectPath(lease.workspaceRoot, value.file_path).toLocaleLowerCase('en-US')
     const work = this.mutationSerial(`${lease.root.id}:${canonical}`, async () => {
       const prepared = await this.prepareNativeMutation(lease, name, args)
+      this.assertLease(lease) // The checkpoint commit itself can consume the final execution space.
       let result: ToolExecutionResult | undefined
       let bodyError: unknown
       try { result = await dispatch() }
@@ -1786,7 +1948,7 @@ export class WorkflowTextController {
       this.commandReceipts.set(value, { lease, checkId: check.id, commandId, timeoutMs })
       return observed.result
     })().catch(error => {
-      if (recorded && this.journal.readRunState(lease.root.id, lease.runId).commands[commandId]?.status === 'running') {
+      if (recorded && !this.journal.readFault() && this.journal.readRunState(lease.root.id, lease.runId).commands[commandId]?.status === 'running') {
         lease.commandRecoveryFailed = true
         this.interruptChild(lease, 'command-exit-unknown', timeoutMs, 0, `${check.id} 的命令结算记录未完成。`)
       }
@@ -2241,7 +2403,7 @@ export class WorkflowTextController {
         answers: z.array(z.strictObject({
           id: z.string(), selected: z.array(z.string()), custom: z.string().optional(),
         })).length(prepared.questions.length),
-      }).parse(await this.driver.ask(root, prepared.questions, combined)).answers
+      }).parse(await this.askCurrent(root, prepared.questions, combined)).answers
       const answerById = new Map(parsed.map(item => [item.id, item]))
       if (answerById.size !== parsed.length || prepared.questions.some(question => !answerById.has(question.id))) {
         throw new Error('原生沉淀回答没有逐项匹配本次候选')
@@ -2383,7 +2545,7 @@ export class WorkflowTextController {
         answers: z.array(z.strictObject({
           id: z.string(), selected: z.array(z.string()), custom: z.string().optional(),
         })).length(1),
-      }).parse(await this.driver.ask(root, prepared.questions, combined)).answers[0]!
+      }).parse(await this.askCurrent(root, prepared.questions, combined)).answers[0]!
       const question = prepared.questions[0]!
       if (parsed.id !== question.id) throw new Error('原生沉淀修订回答没有匹配当前候选')
       if (parsed.custom?.trim()) throw new Error('自定义说明不会被当作长期授权；请使用当前项目、同类工作流或不采纳')
@@ -2462,7 +2624,7 @@ export class WorkflowTextController {
     const combined = AbortSignal.any([signal, questionAbort.signal])
     try {
       const card = prepared.presentation.card
-      const answer = await this.driver.ask(root, [{
+      const answer = await this.askCurrent(root, [{
         id: prepared.questionId,
         question: card.question,
         header: card.header,
@@ -2613,7 +2775,7 @@ export class WorkflowTextController {
 
     const combined = AbortSignal.any([signal, questionAbort.signal])
     try {
-      const answer = await this.driver.ask(root, [{
+      const answer = await this.askCurrent(root, [{
         id: prepared.gateId,
         question: prepared.card.question,
         header: prepared.card.header,
@@ -2740,7 +2902,7 @@ export class WorkflowTextController {
     })
     const combined = AbortSignal.any([signal, abort.signal])
     try {
-      const answer = await this.driver.ask(root, [prepared.question], combined)
+      const answer = await this.askCurrent(root, [prepared.question], combined)
       const decision = explicitAnswer(answer, prepared.id, prepared.question.intent.approve)
       return await this.serial(root.id, async () => {
         combined.throwIfAborted()
@@ -2779,10 +2941,53 @@ export class WorkflowTextController {
     } finally { if (this.questions.get(root) === abort) this.questions.delete(root) }
   }
 
+  /** Host-wide observation; the optional stop remains confined to this root. */
+  async resourcesCommand(agent: Agent, raw: string, signal: AbortSignal): Promise<string> {
+    const root = this.root(agent), action = raw.trim()
+    signal.throwIfAborted()
+    if (!['', 'stop'].includes(action)) throw new Error('用法：/workflow-resources [stop]；不能用命令扩容或跳过占位')
+    if (action === 'stop') {
+      if (root.status === 'running') throw new Error('请先通过原生停止按钮结束当前响应，再核对本会话后台工作')
+      if (!this.journal.readSnapshot(root.id).run) return '当前会话没有工作流运行；没有停止其他会话或解除名额。'
+      const result = await this.stop(root) as { next: string }
+      return result.next
+    }
+    const view = this.hostAdmission.view()
+    return [`Host 并发限制：${view.enabled ? '已启用' : '未启用（以下为观测，不代表已限制）'}。`,
+      ...(this.hostPaused.has(root) ? ['本会话因并发不足暂停；名额释放后须发起新的原生用户消息，旧响应和后台通知不能自行续跑。'] : []),
+      `活动范围 ${view.activeRoots}/${view.maxActiveRoots}；子角色 ${view.roleExecutions}/${view.maxRoleExecutions}；根模型请求 ${view.rootModelRequests}/${view.maxActiveRoots}；取消中或未确认停止 ${view.unconfirmedRoles} 个。`,
+      ...(view.roots.length ? ['占位的原生根会话：', ...view.roots.map(id => `- ${id}`)] : ['当前没有占位范围。']),
+      '此入口只查看；stop 仅请求停止当前会话的工作流，不操作其他会话。取消请求、业务结束或空列表不代表退出。',
+      '未确认停止须先核实并按原生人工处置门禁处理；已有人工结束只代表用户处置，不改写退出证据。没有自动排队或恢复，释放后再次明确推进。'].join('\n')
+  }
+
+  /** Capacity has no top-up/bypass. This native command works without a model request. */
+  async capacityCommand(agent: Agent, raw: string, signal: AbortSignal): Promise<string> {
+    const root = this.root(agent), action = raw.trim()
+    signal.throwIfAborted()
+    if (!['', 'stop'].includes(action)) throw new Error('用法：/workflow-capacity [stop]；不支持扩容或继续执行')
+    const snapshot = this.journal.readSnapshot(root.id)
+    if (!snapshot.capacity) return '当前会话尚未达到日志执行容量上限；未作任何修改。'
+    if (action === 'stop') {
+      if (root.status === 'running') throw new Error('正在封闭当前原生响应；等待响应结束后再核对停止，不覆盖正在进行的回答。')
+      if (!snapshot.run) return JOURNAL_CAPACITY_MESSAGE + ' 尚无受控运行记录，不能据此证明其他后台活动已经停止。'
+      const result = await this.stop(root) as { next: string }
+      return result.next + '\n' + JOURNAL_CAPACITY_MESSAGE
+    }
+    const pending = snapshot.run?.agents.filter(item => item.status === 'running' || item.runtimeIssue?.status === 'unknown').length ?? 0
+    const commands = snapshot.run ? Object.values(this.journal.readRunState(root.id, snapshot.run.runId).commands)
+      .filter(item => item.status === 'running' || item.status === 'unknown').length : 0
+    return [JOURNAL_CAPACITY_MESSAGE,
+      `已保存 ${snapshot.capacity.events} 条事件，${snapshot.capacity.bytes} 字节；执行上限 9000 条／14 MiB，硬上限 10000 条／16 MiB。`,
+      `仍需核对 ${pending} 个 Agent、${commands} 条命令；没有退出证据就不认定已停止。`,
+      '可输入 /workflow-capacity stop 请求停止并核对已记录执行；不调用模型，不删除历史，不补充额度或沿用授权。'].join('\n')
+  }
+
   /** Scoped official slash command: never routed through a model or a custom composer. */
   async budgetCommand(agent: Agent, raw: string, signal: AbortSignal): Promise<string> {
     const root = this.root(agent), action = raw.trim()
     signal.throwIfAborted()
+    if (this.journal.readSnapshot(root.id).capacity) return JOURNAL_CAPACITY_MESSAGE + ' 请用 /workflow-capacity 核对；预算补额不能解除日志容量暂停。'
     if (!['', 'topup', 'end'].includes(action)) throw new Error('用法：/workflow-budget [topup|end]；不接受额度或执行指令')
     if (action && root.status === 'running') throw new Error('请等待当前原生对话结束，再申请预算处置；不会打断或覆盖正在进行的回答')
     const snapshot = this.journal.readSnapshot(root.id), account = snapshot.run?.budget
@@ -2830,7 +3035,7 @@ export class WorkflowTextController {
     })
     const combined = AbortSignal.any([signal, questionAbort.signal])
     try {
-      const answer = await this.driver.ask(root, [prepared.question], combined)
+      const answer = await this.askCurrent(root, [prepared.question], combined)
       const decision = explicitAnswer(answer, prepared.request.gateId, MANUAL_CLOSE_LABEL)
       return await this.serial(root.id, async () => {
         combined.throwIfAborted()
@@ -2924,6 +3129,14 @@ export class WorkflowTextController {
   close(): Promise<void> {
     if (this.disposal) return this.disposal
     this.closed = true
+    this.hostAdmission.close()
+    for (const root of this.rootModelScopes) {
+      try { this.driver.cancelRoot?.(root, 'host-resources') }
+      catch (error) { this.logRuntimeError(error) } // Still revoke children; unsettled streams keep close fail-closed.
+    }
+    this.unsubscribeCapacity()
+    this.unsubscribeFault()
+    this.capacityRoots.clear()
     this.childWatchdog.close()
     this.rootObservers.clear()
     for (const question of this.questions.values()) question.abort(new Error('工作流插件卸载'))
@@ -2934,7 +3147,7 @@ export class WorkflowTextController {
     this.disposal = (async () => {
       const timeClosed = this.runTime.close()
       const cleanup = (async () => {
-        await Promise.all([timeClosed, ...[...this.leases.values()].map(lease => this.drainLease(lease))])
+        await Promise.all([timeClosed, this.hostAdmission.whenModelsIdle(), ...[...this.leases.values()].map(lease => this.drainLease(lease))])
         await Promise.all([...this.mutationQueues.values()])
         await Promise.all([...this.recoveries])
         await Promise.all([...this.queues.values()])

@@ -1,6 +1,6 @@
 import { createElement as h, useState } from 'react'
 import {
-  Button, IconCheckOutline14, IconEditOutline16, MarkdownText,
+  Button, IconCheckOutlineMedium as IconCheckOutline14, IconEditOutlineMedium as IconEditOutline16, MarkdownText,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   approveRequirementsGate, requirementsGateQuestion, reviseRequirementsGate,

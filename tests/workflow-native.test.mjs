@@ -7,10 +7,12 @@ import { tmpdir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { randomUUID } from 'node:crypto'
+import { createRequire } from 'node:module'
+import { DatabaseSync } from 'node:sqlite'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { completedCommandHandle } from './helpers/workflow-command-fixture.mjs'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
-import AgentPresets from '@deepseek-ai/dsh-agent-presets'
+import { registerFixturePresets } from './helpers/declarative-preset-fixture.mjs'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
@@ -28,6 +30,11 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import * as Control from '../lib/workflow-control.js'
 import * as Engine from '../lib/workflow-engine.js'
 import { proposal } from './helpers/workflow-controller-fixture.mjs'
+import { fillJournalBytes, recoveryPair } from './helpers/workflow-capacity-fixture.mjs'
+import { workflowReadHandler } from '../lib/workflow-runtime.js'
+import { WorkflowJournal, parseWorkflowJournalRecord } from '../lib/workflow-journal.js'
+import { displayWorkflowState } from '../lib/workflow-display.js'
+import { createPresetAdmission, readPresetDefinition, verifyDeclarativeRuntime } from '../scripts/lib/workflow-declarative-preset.mjs'
 
 const labRoot = dirname(dirname(fileURLToPath(import.meta.url)))
 const signal = new AbortController().signal
@@ -190,13 +197,25 @@ async function registerProjectNativeFixtures(ctx, workspaceRoot, commandHandle, 
       stdoutMaxBytes: request.stdoutMaxBytes ?? 64 * 1024,
       sandboxPolicy: request.sandboxPolicy,
     } }
-    async run(spec) {
+    async execute(spec) {
       observedShellModes.push(spec.sandboxPolicy?.mode)
-      await this.ctx.subprocess.spawn({ signal: spec.signal }).done
-      return {
-        exitCode: 0, signal: null, timedOut: false, aborted: false, timeoutMs: spec.timeoutMs,
+      const handle = this.ctx.subprocess.spawn({ signal: spec.signal })
+      const result = handle.done.then(exit => ({
+        exitCode: exit.exitCode, signal: exit.signal, timedOut: false, aborted: spec.signal?.aborted ?? false, timeoutMs: spec.timeoutMs,
         stdout: { text: 'tests passed', truncated: false }, stderr: { text: '', truncated: false },
         sandbox: { mode: spec.sandboxPolicy?.mode ?? 'workspace-write', denied: false },
+      }))
+      let settled = false
+      let exitCode = null, exitSignal = null
+      void result.then(exit => { settled = true; exitCode = exit.exitCode; exitSignal = exit.signal }, () => { settled = true })
+      const silentReader = { readFrom: fromByte => ({ text: '', nextOffset: fromByte, lossy: false }) }
+      return {
+        done: handle.done.then(() => undefined), result: () => result,
+        get status() { return !settled ? 'running' : exitSignal === null ? 'completed' : 'killed' },
+        get exitCode() { return exitCode }, get signal() { return exitSignal },
+        readOutput: () => ({ delta: '', lossy: false }),
+        observed: { stdout: silentReader, stderr: silentReader },
+        kill() { if (settled) return false; handle.terminate(); return true },
       }
     }
     start() { throw new Error('background execution is disabled in the workflow preset fixture') }
@@ -229,8 +248,8 @@ async function registerProjectNativeFixtures(ctx, workspaceRoot, commandHandle, 
   return observedShellModes
 }
 
-async function harness(t, { reportAfterController = false, childConfig = {}, rootConfig = {}, runBudgetConfig = {},
-  rootSessionId = `native-workflow-${randomUUID()}`, commandHandle, ask, realProcesses = false } = {}) {
+async function harness(t, { reportAfterController = false, childConfig = {}, rootConfig = {}, runBudgetConfig = {}, hostAdmissionConfig = {},
+  rootSessionId = `native-workflow-${randomUUID()}`, commandHandle, ask, realProcesses = false, setupAdmission } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'workflow-native-test-'))
   const ctx = new Context()
   ctx.baseUrl = pathToFileURL(labRoot).href + '/'
@@ -240,10 +259,7 @@ async function harness(t, { reportAfterController = false, childConfig = {}, roo
   await ctx.plugin(TestSessionQuery)
   await ctx.plugin(AgentLoop, { agents: [] })
   const observedShellModes = await registerProjectNativeFixtures(ctx, directory, commandHandle, realProcesses)
-  await ctx.plugin(AgentPresets, { default: Control.WORKFLOW_PRESET_ID, roots: [
-    { path: join(labRoot, 'preset'), trust: 'user' },
-    { path: join(labRoot, 'tests/fixtures/presets'), trust: 'user' },
-  ], includeUserRoot: false })
+  await registerFixturePresets(ctx, labRoot, Control.WORKFLOW_PRESET_ID)
   await ctx.plugin(Subagents)
   await ctx.plugin(Spawn, { providerName: 'spawn' })
   if (!reportAfterController) await ctx.plugin(NativeControl)
@@ -270,11 +286,13 @@ async function harness(t, { reportAfterController = false, childConfig = {}, roo
     routes.set(channel, handler)
     return async () => { routes.delete(channel) }
   } } })
-  const engineFiber = await ctx.plugin(Engine, { dataDirectory: join(directory, 'journal'),
-    runBudgetEnabled: true, runBudgetScope: 'all', ...childConfig, ...rootConfig, ...runBudgetConfig })
+  let engineFiber
+  t.after(async () => { await engineFiber?.dispose(); await ctx.fiber.dispose(); assert.equal(routes.size, 0) })
+  if (setupAdmission) ctx.provide('workflowReleaseReady', await setupAdmission({ ctx, directory }))
+  engineFiber = await ctx.plugin(Engine, { dataDirectory: join(directory, 'journal'),
+    runBudgetEnabled: true, runBudgetScope: 'all', ...childConfig, ...rootConfig, ...runBudgetConfig, ...hostAdmissionConfig })
   if (reportAfterController) await ctx.plugin(NativeControl)
   const storage = { journal: ctx.workflowJournal, directory: join(directory, 'journal') }
-  t.after(async () => { await engineFiber.dispose(); assert.equal(routes.size, 0); await ctx.fiber.dispose() })
   if (realProcesses) {
     // Keep the nested node --test runner real. This environment belongs to this
     // isolated test-file process, not the live DSH Host or other test files.
@@ -323,6 +341,55 @@ async function additionalRoot(host, id, meta = {}, preset = Control.WORKFLOW_PRE
   host.adapter.additionalRoots.add(agent.id)
   return agent
 }
+
+test('native Host admission rejects before provider dispatch and keeps cancellation occupancy until stream settlement', timeout, async t => {
+  const host = await harness(t, { hostAdmissionConfig: { hostAdmissionEnabled: true, hostMaxActiveRoots: 1, hostMaxRoleExecutions: 2 } })
+  const other = await additionalRoot(host, `resource-other-${randomUUID()}`), held = Promise.withResolvers()
+  const blank = await additionalRoot(host, `resource-blank-${randomUUID()}`)
+  assert.equal((await tool(host, 'workflow_propose', proposal(0), other)).isError, false)
+  const before = host.storage.journal.readSnapshot(other.id)
+  const send = root => root.followup(createUserMessage({ content: [{ type: 'text', text: '只核对，不建立工作流' }], source: { kind: 'user' } }))
+  host.adapter.rootScript = async () => { await held.promise; return textChunks('受控根响应') }
+  try {
+    send(host.root)
+    await waitFor(() => host.adapter.requests.length === 1, 'first native model occupies its slot')
+    send(other); await other.whenIdle()
+    assert.equal(host.adapter.requests.filter(request => request.sessionId === other.id).length, 0)
+    assert.deepEqual(host.storage.journal.readSnapshot(other.id), before, 'capacity refusal precedes cumulative request charging')
+    assert.equal(before.run.budget.used.rootModel, 0)
+    send(blank); await blank.whenIdle()
+    assert.equal(host.adapter.requests.filter(request => request.sessionId === blank.id).length, 0)
+    assert.equal(host.storage.journal.readSnapshot(blank.id).run, null, 'ingress is covered even before a formal run exists')
+    const observed = await host.ctx.commands.execute(other, '/workflow-resources', [], signal)
+    assert.equal(observed.result.kind, 'success'); assert.match(observed.result.text, /根模型请求 1\/1/)
+    assert.equal(host.adapter.requests.length, 1, 'native resource command does not call the model')
+    host.root.cancel({ kind: 'hook', reason: 'controlled admission cancellation test' }, { keepInbox: true })
+    assert.equal(host.ctx.workflowController.hostAdmission.view().rootModelRequests, 1, 'cancel signal is not iterator settlement')
+    held.resolve()
+    await waitFor(() => host.ctx.workflowController.hostAdmission.view().rootModelRequests === 0, 'settled stream releases its own slot')
+    await host.root.whenIdle()
+    host.adapter.rootScript = () => textChunks('新的明确请求')
+    send(other); await other.whenIdle()
+    assert.equal(host.adapter.requests.filter(request => request.sessionId === other.id).length, 1)
+    assert.equal(host.ctx.workflowController.hostAdmission.view().activeRoots, 0)
+  } finally { held.resolve(); await host.root.whenIdle(); await other.whenIdle(); await blank.whenIdle() }
+})
+
+test('native bounded admission preserves full text workflow rework and releases completed role ranges', timeout, async t => {
+  const host = await harness(t, { hostAdmissionConfig: { hostAdmissionEnabled: true, hostMaxActiveRoots: 1, hostMaxRoleExecutions: 2 } })
+  const peaks = []
+  host.ctx.on('subagent/start', () => peaks.push(host.ctx.workflowController.hostAdmission.view().roleExecutions))
+  host.adapter.drive = true
+  host.root.followup(createUserMessage({ content: [{ type: 'text', text: '验证完整文本工作流' }], source: { kind: 'user' } }))
+  await waitFor(() => host.storage.journal.readSnapshot(host.root.id).run?.outcome === 'PASS', 'bounded workflow completes')
+  await host.root.whenIdle()
+  const snapshot = host.storage.journal.readSnapshot(host.root.id)
+  assert.equal(host.storage.journal.readRunState(host.root.id, snapshot.run.runId).returns.length, 1)
+  assert.equal(snapshot.run.latestReturn.attempt, 1)
+  assert.ok(peaks.length >= 4 && peaks.every(value => value >= 1 && value <= 2))
+  assert.equal(host.ctx.workflowController.hostAdmission.view().roleExecutions, 0)
+  assert.equal(host.ctx.workflowController.hostAdmission.view().rootModelRequests, 0)
+})
 
 test('native scope meters only the exact selected root while another root and its fork keep old behavior', timeout, async t => {
   const selectedId = `selected-budget-${randomUUID()}`
@@ -681,6 +748,196 @@ test('native command admission refuses the next frozen check before starting its
 })
 
 const processBudgetOptions = { timeout: 35000, skip: process.platform !== 'win32' ? 'Windows real-process integration' : false }
+
+test('native root provider failure remains an explicit native error and cannot grant approval or start work', timeout, async t => {
+  const host = await harness(t, { runBudgetConfig: { runBudgetEnabled: false } })
+  assert.equal((await tool(host, 'workflow_propose', proposal(0))).isError, false)
+  const before = host.storage.journal.readSnapshot(host.root.id)
+  host.adapter.rootScript = () => { throw new Error('isolated root provider unavailable') }
+  host.root.followup(createUserMessage({ content: [{ type: 'text', text: '隔离模型失败验证' }], source: { kind: 'user' } }))
+  await host.root.whenIdle()
+  assert.equal(host.adapter.requests.length, 1)
+  assert.ok(host.runtimeErrors.some(item => item.id === host.root.id && item.reason.kind === 'error'))
+  assert.deepEqual(host.storage.journal.readSnapshot(host.root.id), before)
+  assert.equal(before.run.agents.length, 0)
+  assert.equal(before.run.outcome, null)
+  assert.equal(host.storage.journal.readFault(), undefined, 'provider failure is not a Journal fault')
+})
+
+test('native child provider failure is a failed role, not a fabricated QA failure, retry or successful delivery', timeout, async t => {
+  const host = await harness(t)
+  const snapshot = () => host.storage.journal.readSnapshot(host.root.id)
+  assert.equal((await tool(host, 'workflow_propose', proposal(0))).isError, false)
+  assert.equal((await tool(host, 'workflow_confirm', { expectedRevision: snapshot().revision })).isError, false)
+  host.adapter.holdChild = async () => { throw new Error('isolated child provider unavailable') }
+  await tool(host, 'workflow_advance', { expectedRevision: snapshot().revision })
+  await waitFor(() => snapshot().run.tasks.some(task => task.taskId === 'author' && task.status === 'failed')
+    && snapshot().run.agents.every(agent => agent.status !== 'running'), 'failed native child has a recorded role outcome')
+  await host.root.whenIdle()
+  const view = snapshot()
+  assert.equal(view.run.outcome, null)
+  assert.equal(view.run.ledger.fail, 0)
+  assert.equal(view.run.latestReturn, null)
+  assert.equal(view.run.agents.length, 1)
+  assert.equal(host.adapter.requests.filter(req => req.sessionId !== host.root.id).length, 1)
+  const display = displayWorkflowState({ status: 'ready', snapshot: view }, [],
+    ['需求确认', '计划与拆解', '实现', '验证', '独立审查', '交付', '沉淀'].map(name => ({ name, purpose: name })))
+  assert.equal(display.needsUser, true)
+  assert.equal(view.run.needsUser, true)
+  assert.equal(display.badge, '角色执行异常')
+  assert.match(display.next, /停止本轮.*重新确认/u)
+  assert.equal((await tool(host, 'workflow_advance', { expectedRevision: view.revision })).isError, true)
+  assert.equal(host.adapter.requests.filter(req => req.sessionId !== host.root.id).length, 1)
+  assert.deepEqual(snapshot(), view, 'a denied retry cannot consume business rework or rewrite failed evidence')
+  assert.equal(host.storage.journal.readFault(), undefined)
+})
+
+test('real SQLite write lock revokes and drains an in-flight native PowerShell range without manufacturing durable exit evidence',
+  { ...processBudgetOptions, timeout: 60000 }, async t => {
+    // A failed Journal must not be read by processEvidence's ordinary terminal
+    // snapshot hook. Capture both the failure envelope and unchanged raw row.
+    const evidence = { name: 'storage-fault-process', scope: 'temporary official Host; scripted models; no live 3080 access', phases: [] }
+    const capture = { attach() {}, record(phase, detail) { evidence.phases.push({ phase, detail }) } }
+    const { host, snapshot, invoke } = await prepareRealProcessRun(t, capture, { hold: true,
+      runBudgetConfig: { runBudgetEnabled: false } })
+    await invoke('workflow_advance')
+    await waitFor(() => snapshot().run.agents.some(a => a.taskId === 'code-review' && a.status === 'idle'), 'parallel reviewer settled before disk fault')
+    await host.root.whenIdle()
+    let owned
+    const deadline = Date.now() + 6000
+    while (!owned && Date.now() < deadline) {
+      try { owned = JSON.parse(await readFile(join(host.directory, 'budget-owned-pids.json'), 'utf8')) }
+      catch (error) { if (error.code !== 'ENOENT') throw error; await new Promise(resolve => setTimeout(resolve, 10)) }
+    }
+    assert.ok(owned)
+    for (const pid of [owned.testPid, owned.descendantPid]) assert.doesNotThrow(() => process.kill(pid, 0))
+    const before = snapshot(), external = new DatabaseSync(join(host.storage.directory, 'journal.sqlite'))
+    let rowBefore, rowAfter
+    try {
+      rowBefore = external.prepare('SELECT value FROM u_workflow_runtime_sessions WHERE key = ?').get(host.root.id).value
+      external.exec('BEGIN IMMEDIATE')
+      try {
+        await assert.rejects(host.storage.journal.commit({ rootSessionId: host.root.id, expectedRevision: before.revision,
+          events: recoveryPair(before) }), error => error.code === 'recovery-required')
+      } finally { external.exec('ROLLBACK') }
+      await waitFor(() => [owned.testPid, owned.descendantPid].every(pid => {
+        try { process.kill(pid, 0); return false } catch (error) { if (error.code === 'ESRCH') return true; throw error }
+      }), 'storage failure stops actual managed descendant processes', 10000)
+      await host.root.whenIdle()
+      const engineering = before.run.agents.find(a => a.taskId === 'engineering-test')
+      // Process exit may precede AgentLoop/tool finalization. Observe both;
+      // root idleness is not proof that a delegated Agent has drained.
+      await waitFor(() => host.ctx.agents.get(engineering.agentSessionId)?.status !== 'running', 'native engineering Agent finishes cancellation', 5000)
+      assert.equal(host.ctx.agents.get(engineering.agentSessionId)?.status === 'running', false)
+      assert.throws(() => snapshot(), /reopen/)
+      const envelope = await workflowReadHandler(host.storage.journal)('snapshot', { schemaVersion: 1, rootSessionId: host.root.id }, signal)
+      assert.equal(envelope.error.details.workflowFault.kind, 'storage-write')
+      rowAfter = external.prepare('SELECT value FROM u_workflow_runtime_sessions WHERE key = ?').get(host.root.id).value
+      assert.equal(rowAfter, rowBefore, 'no failed write, synthetic stopped row, business FAIL or implicit approval')
+      assert.equal(await readFile(join(host.directory, 'src/native.js'), 'utf8'), 'export const nativeReady = true\n')
+      const requests = host.adapter.requests.length
+      assert.equal((await tool(host, 'workflow_advance', { expectedRevision: before.revision })).isError, true)
+      host.root.followup(createUserMessage({ content: [{ type: 'text', text: '故障后不可续跑' }], source: { kind: 'user' } }))
+      await host.root.whenIdle()
+      assert.equal(host.adapter.requests.length, requests)
+      const record = parseWorkflowJournalRecord(JSON.parse(rowAfter)), rows = new Map([[host.root.id, record]])
+      const cold = new WorkflowJournal({ get: key => rows.get(key), entries: () => rows.entries(), put: async (key, value) => { rows.set(key, value) } })
+      const controller = new Control.WorkflowTextController(cold, {}, {
+        isRoot: () => false, isLive: () => false, ensureRootDurable: async () => {},
+        ask: async () => { throw new Error('cold recovery must not ask') }, start: async () => { throw new Error('cold recovery must not dispatch') },
+        resume: async () => { throw new Error('cold recovery must not resume') }, drain: async () => {}, notify() {},
+      })
+      try {
+        await controller.recoverOrphanedLeases()
+        const recovered = cold.readSnapshot(host.root.id)
+        assert.equal(recovered.run.agents.find(a => a.taskId === 'engineering-test').runtimeIssue.status, 'unknown')
+        assert.equal(recovered.run.outcome, null)
+        assert.equal(recovered.run.ledger.fail, 0)
+        assert.equal(Object.values(cold.readRunState(host.root.id, before.run.runId).commands)[0].status, 'unknown')
+        evidence.recovered = recovered
+      } finally { await controller.close(); await cold.close() }
+      evidence.status = 'passed'; evidence.owned = owned; evidence.fault = envelope.error.details.workflowFault
+      evidence.rawRowUnchanged = true; evidence.physicalExitVerified = true; evidence.originalFilesRetained = true
+      if (process.env.WORKFLOW_PROCESS_EVIDENCE_DIR) await writeFile(join(process.env.WORKFLOW_PROCESS_EVIDENCE_DIR, 'storage-fault-process.json'),
+        JSON.stringify(evidence, null, 2) + '\n', { flag: 'wx' })
+    } finally { external.close() }
+  })
+
+test('official capacity command remains model-free and stale native requests cannot dispatch after byte high-water', { timeout: 60000 }, async t => {
+  const host = await harness(t, { runBudgetConfig: { runBudgetEnabled: false } })
+  const journal = host.storage.journal, snapshot = () => journal.readSnapshot(host.root.id)
+  await fillJournalBytes(journal, host.root.id)
+  host.adapter.rootScript = options => new Promise((resolve, reject) => {
+    if (options.signal.aborted) return reject(options.signal.reason)
+    options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+  })
+  host.root.followup(createUserMessage({ content: [{ type: 'text', text: '触顶前已在运行的隔离响应' }], source: { kind: 'user' } }))
+  await waitFor(() => host.adapter.requests.length === 1, 'native root provider is actually in flight')
+  const events = recoveryPair(snapshot()); events[0].payload.reason = 'x'.repeat(128 * 1024)
+  await journal.commit({ rootSessionId: host.root.id, expectedRevision: snapshot().revision, events })
+  assert.equal(snapshot().capacity.reason, 'bytes')
+  await host.root.whenIdle()
+  assert.equal(host.adapter.requests[0].signal.aborted, true)
+  host.root.followup(createUserMessage({ content: [{ type: 'text', text: '不能越过容量继续' }], source: { kind: 'user' } }))
+  await host.root.whenIdle()
+  assert.equal(host.adapter.requests.length, 1, 'the second native model request never reaches the provider')
+  assert.equal(snapshot().run, null)
+  const result = await host.ctx.commands.execute(host.root, '/workflow-capacity', [], signal)
+  assert.equal(result.result.kind, 'success')
+  assert.match(result.result.text, /日志|容量/)
+  const invalid = await host.ctx.commands.execute(host.root, '/workflow-capacity topup', [], signal)
+  assert.equal(invalid.result.kind, 'error')
+  assert.equal(host.adapter.requests.length, 1)
+  const other = await additionalRoot(host, `healthy-capacity-${randomUUID()}`)
+  host.adapter.rootScript = () => textChunks('另一原生会话仍可用')
+  other.followup(createUserMessage({ content: [{ type: 'text', text: '独立会话' }], source: { kind: 'user' } }))
+  await other.whenIdle()
+  assert.equal(host.adapter.requests.length, 2)
+  assert.equal(host.adapter.requests[1].sessionId, other.id)
+})
+
+test('real PowerShell capacity interruption records actual process exits without business FAIL or implicit file rollback',
+  { ...processBudgetOptions, timeout: 60000 }, async t => {
+    const evidence = processEvidence(t, 'journal-capacity-exhaustion')
+    const { host, snapshot, invoke } = await prepareRealProcessRun(t, evidence, {
+      hold: true, runBudgetConfig: { runBudgetEnabled: false },
+    })
+    const journal = host.storage.journal
+    await fillJournalBytes(journal, host.root.id)
+    assert.equal(snapshot().capacity, undefined)
+    await invoke('workflow_advance')
+    let owned
+    const deadline = Date.now() + 6000
+    while (!owned && Date.now() < deadline) {
+      try { owned = JSON.parse(await readFile(join(host.directory, 'budget-owned-pids.json'), 'utf8')) }
+      catch (error) { if (error.code !== 'ENOENT') throw error; await new Promise(resolve => setTimeout(resolve, 10)) }
+    }
+    assert.ok(owned, 'both actual descendant processes must be alive at capacity crossing')
+    for (const pid of [owned.testPid, owned.descendantPid]) assert.doesNotThrow(() => process.kill(pid, 0))
+    evidence.record('before-capacity', { owned })
+    const events = recoveryPair(snapshot()); events[0].payload.reason = 'x'.repeat(128 * 1024)
+    await journal.commit({ rootSessionId: host.root.id, expectedRevision: snapshot().revision, events })
+    const commands = () => Object.values(journal.readRunState(host.root.id, snapshot().run.runId).commands)
+    await waitFor(() => commands().length === 1 && commands()[0].status !== 'running'
+      && snapshot().run.agents.some(agent => agent.taskId === 'engineering-test' && agent.runtimeIssue?.status === 'stopped'),
+    'capacity drains the official command scope', 12000)
+    await host.root.whenIdle()
+    assert.equal(snapshot().capacity.reason, 'bytes')
+    assert.equal(commands()[0].status, 'interrupted')
+    assert.equal(commands()[0].observation.exitConfirmed, true)
+    assert.equal(commands()[0].observation.toolSettled, true)
+    for (const pid of [owned.testPid, owned.descendantPid]) assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH')
+    assert.equal(snapshot().run.agents.find(agent => agent.taskId === 'engineering-test').runtimeIssue.cause, 'stop-requested')
+    assert.equal(snapshot().run.outcome, null)
+    assert.equal(snapshot().run.ledger.fail, 0)
+    assert.equal(await readFile(join(host.directory, 'src/native.js'), 'utf8'), 'export const nativeReady = true\n')
+    assert.ok(snapshot().capacity.bytes < snapshot().capacity.hardBytes)
+    const requestCount = host.adapter.requests.length
+    const status = await host.ctx.commands.execute(host.root, '/workflow-capacity', [], signal)
+    assert.equal(status.result.kind, 'success')
+    assert.equal(host.adapter.requests.length, requestCount)
+    evidence.record('capacity-exits-confirmed', { capacity: snapshot().capacity, commands: commands(), owned })
+  })
 
 function processEvidence(t, name) {
   const evidence = { name, startedAt: new Date().toISOString(),
@@ -1189,6 +1446,7 @@ test('native blank-session preset selection binds on entry and releases Workflow
   for (let round = 0; round < 2; round++) {
     await select(Control.WORKFLOW_PRESET_ID)
     await waitFor(() => host.ctx.commands.list(agent).some(item => item.name === 'workflow-budget'), 'scoped native command appears')
+    assert.ok(host.ctx.commands.list(agent).some(item => item.name === 'workflow-resources'))
     const workflow = await read()
     assert.deepEqual(workflow.tools.map(item => item.name).sort(), [...Control.ROOT_TOOLS].sort())
     assert.equal(workflow.sections.some(item => item.name === 'crew:pm'), false)
@@ -1197,6 +1455,7 @@ test('native blank-session preset selection binds on entry and releases Workflow
     await select('plain-test')
     await waitFor(() => !host.ctx.commands.list(agent).some(item => item.name === 'workflow-budget'), 'scoped native command released')
     assert.equal(await host.ctx.commands.execute(agent, '/workflow-budget', [], signal), undefined)
+    assert.equal(await host.ctx.commands.execute(agent, '/workflow-resources', [], signal), undefined)
     const restored = await read()
     assert.deepEqual(restored.tools.map(item => item.name).sort(), original.tools.map(item => item.name).sort())
     assert.ok(restored.sections.some(item => item.name === 'crew:pm'))
@@ -1479,4 +1738,62 @@ test('real running child loses every capability when stopped; unrelated roots ar
   assert.equal(host.ctx.agents.get(host.root.id), host.root)
   assert.equal(host.ctx.agents.get(other.agent.id), other.agent)
   assert.equal(host.storage.journal.readSnapshot(other.agent.id).revision, 0)
+})
+
+async function admissionForFixture(ctx, beforeAudit, onVerified) {
+  const requireHost = createRequire(join(labRoot, 'package.json'))
+  const include = await import('@deepseek-ai/cordis-plugin-include')
+  const yaml = createRequire(requireHost.resolve('@deepseek-ai/dsh-app-boot'))('js-yaml')
+  const evidence = { packageRoot: labRoot, requireHost, include, yaml }
+  const definition = await readPresetDefinition(evidence, Control.WORKFLOW_PRESET_ID)
+  return createPresetAdmission(async () => {
+    await beforeAudit?.({ ctx, definition })
+    const original = ctx.loader.await
+    ctx.loader.await = () => { throw new Error('audit must not wait on the activating Host Loader') }
+    try { await verifyDeclarativeRuntime(ctx, evidence, definition) }
+    finally { ctx.loader.await = original }
+  }, onVerified)
+}
+
+test('native distributed release audits its actual declaration after the controller and only then binds a root', timeout, async t => {
+  let admission, controllerPresent = false, opened = 0
+  const host = await harness(t, { setupAdmission: async ({ ctx }) => {
+    admission = await admissionForFixture(ctx, () => { controllerPresent = !!ctx.workflowController }, () => { opened++ })
+    assert.throws(() => admission.assertReady(), /not-verified/u)
+    return admission
+  } })
+  assert.equal(controllerPresent, true); assert.equal(opened, 1)
+  admission.assertReady()
+  assert.equal(host.ctx.workflowController.driver.isRoot(host.root), true)
+  assert.deepEqual([...host.ctx.workflowController.rootModelTools(host.root)].sort(), [...Control.ROOT_TOOLS].sort())
+})
+
+test('native distributed release fails a tampered Loader declaration and releases its Journal owner before any Agent starts', timeout, async t => {
+  let capturedCtx, capturedDirectory, admitted = 0
+  await assert.rejects(harness(t, { setupAdmission: async ({ ctx, directory }) => {
+    capturedCtx = ctx; capturedDirectory = directory
+    return admissionForFixture(ctx, async ({ definition }) => {
+      const entry = [...ctx.loader.entries()].find(entry => entry.options.id === 'workflow-agent-preset-declaration')
+      await entry.update({ config: { ...definition, plugins: [] } })
+    }, () => { admitted++ })
+  } }), /active-declaration-changed/u)
+  assert.equal(admitted, 0)
+  assert.equal(capturedCtx.agents.list().length, 0)
+  await assert.rejects(readFile(join(capturedDirectory, 'journal/writer.lock')), { code: 'ENOENT' })
+})
+
+test('native distributed release vetoes a new Workflow Agent after admission revocation without restricting another preset', timeout, async t => {
+  let admission
+  const host = await harness(t, { setupAdmission: async ({ ctx }) => {
+    admission = await admissionForFixture(ctx)
+    return admission
+  } })
+  admission.revoke()
+  const before = host.storage.journal.readSnapshot(host.root.id)
+  assert.equal((await tool(host, 'workflow_propose', proposal(before.revision))).isError, true)
+  assert.equal(host.storage.journal.readSnapshot(host.root.id).revision, before.revision)
+  await assert.rejects(additionalRoot(host, 'release-revoked-root'), /not-verified/u)
+  assert.equal(host.ctx.agents.get(SessionId('release-revoked-root')), undefined)
+  const plain = await additionalRoot(host, 'release-unrelated-root', {}, 'plain-test')
+  assert.equal(host.ctx.workflowController.driver.isRoot(plain), false)
 })

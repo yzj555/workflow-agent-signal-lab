@@ -1,18 +1,26 @@
 import type { ClientConnectionRpc } from '@deepseek-ai/dsh-client-connection/client'
-import { WORKFLOW_RPC_CHANNEL, workflowSnapshotSchema } from '../workflow-view.ts'
-import type { WorkflowSnapshot } from '../workflow-view.ts'
+import { WORKFLOW_RPC_CHANNEL, workflowSnapshotSchema, workflowReadFaultSchema } from '../workflow-view.ts'
+import type { WorkflowSnapshot, WorkflowReadFault } from '../workflow-view.ts'
+
+class WorkflowReadUnavailable extends Error {
+  constructor(readonly fault: WorkflowReadFault) { super('workflow durable state requires recovery') }
+}
 
 /** Uses DSH's existing transport, not a new chat or an unguarded fetch endpoint. */
 export async function readWorkflowSnapshot(rpc: ClientConnectionRpc, rootSessionId: string, signal?: AbortSignal): Promise<WorkflowSnapshot> {
   const result = await rpc.call(WORKFLOW_RPC_CHANNEL, 'snapshot', { schemaVersion: 1, rootSessionId }, signal)
-  if (!result.ok) throw new Error(`workflow snapshot unavailable: ${result.error.message}`)
+  if (!result.ok) {
+    const fault = workflowReadFaultSchema.safeParse((result.error.details as { workflowFault?: unknown }).workflowFault)
+    if (result.error.code === 'internal' && fault.success && fault.data.rootSessionId === rootSessionId) throw new WorkflowReadUnavailable(fault.data)
+    throw new Error('workflow snapshot unavailable')
+  }
   const snapshot = workflowSnapshotSchema.parse(result.value)
   if (snapshot.rootSessionId !== rootSessionId) throw new Error('workflow response belongs to another root Session')
   return snapshot
 }
 
 export type WorkflowClientState =
-  | { readonly status: 'loading' | 'unavailable'; readonly snapshot: null }
+  | { readonly status: 'loading' | 'unavailable'; readonly snapshot: null; readonly fault?: WorkflowReadFault }
   | { readonly status: 'ready' | 'absent'; readonly snapshot: WorkflowSnapshot }
 
 const LOADING: WorkflowClientState = Object.freeze({ status: 'loading', snapshot: null })
@@ -115,8 +123,9 @@ export class WorkflowSnapshotSource {
       if (previous !== null && snapshot.revision === previous.revision
         && (snapshot.budgetRevision ?? 0) === (previous.budgetRevision ?? 0)) return
       this.publish(entry, immutable({ status: snapshot.availability, snapshot }))
-    }).catch(() => {
-      if (current()) this.publish(entry, UNAVAILABLE)
+    }).catch(error => {
+      if (current()) this.publish(entry, error instanceof WorkflowReadUnavailable
+        ? immutable({ status: 'unavailable', snapshot: null, fault: error.fault }) : UNAVAILABLE)
     }).finally(() => {
       clearTimeout(timeout)
       if (!current()) return

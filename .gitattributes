@@ -1,0 +1,3 @@
+# Preserve exact source bytes across machines: release manifests hash raw files.
+# Existing LF/CRLF choices are intentional snapshot inputs; do not normalize them.
+* -text

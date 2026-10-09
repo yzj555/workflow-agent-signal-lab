@@ -4,8 +4,10 @@ import * as Sqlite from '@deepseek-ai/dsh-storage-sqlite'
 import * as Domains from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 import { join } from 'node:path'
+import { realpath } from 'node:fs/promises'
 import { WorkflowJournal, parseWorkflowJournalRecord } from '../workflow-journal.ts'
 import { acquireWorkflowOwner } from './workflow-owner.ts'
+import type { WorkflowOwner } from './workflow-owner.ts'
 
 export const WORKFLOW_DOMAIN_NAME = 'workflow_runtime'
 export const workflowDomainSpec = Domains.defineDomain({
@@ -29,10 +31,11 @@ export interface WorkflowStorageRuntime {
 }
 
 /** Private official storage composition; never changes the Host's global storage routing. */
-export async function openWorkflowStorage(dataDirectory: string, reportError: (error: unknown) => void = () => {}): Promise<WorkflowStorageRuntime> {
-  const owner = await acquireWorkflowOwner(dataDirectory)
+export async function openWorkflowStorage(dataDirectory: string, reportError: (error: unknown) => void = () => {}, suppliedOwner?: WorkflowOwner): Promise<WorkflowStorageRuntime> {
+  const owner = suppliedOwner ?? await acquireWorkflowOwner(dataDirectory)
   const ctx = new Context()
   try {
+    if ((await realpath(dataDirectory)).toLowerCase() !== owner.directory.toLowerCase()) throw new Error('workflow startup owner belongs to another data directory')
     await ctx.plugin(Storage)
     await ctx.plugin(Sqlite, { path: join(owner.directory, 'journal.sqlite'), journalMode: 'wal' })
     await ctx.plugin(Domains, { backend: 'sqlite' })

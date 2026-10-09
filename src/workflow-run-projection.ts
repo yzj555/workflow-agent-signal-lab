@@ -5,6 +5,7 @@ import { pilotContract } from './workflow-pilot-contract.ts'
 import { criterionCheckIds, decodeWorkflowChecks, projectContract } from './workflow-project-contract.ts'
 import { PROJECT_PILOT, TEXT_PILOT } from './workflow-profiles.ts'
 import type { WorkflowRunView } from './workflow-view.ts'
+import { workflowFailedRoles } from './workflow-view.ts'
 
 function executionProfile(state: WorkflowRunState): typeof TEXT_PILOT | typeof PROJECT_PILOT | undefined {
   try {
@@ -82,6 +83,7 @@ export function projectWorkflowRun(state: WorkflowRunState): WorkflowRunView {
     riskLevel: state.risk?.level ?? null, outcome: state.outcome?.outcome ?? null,
     needsUser: gates.some(gate => gate.status === 'waiting' && !gate.stale && gate.requiredActor === 'user')
       || rollbackPending !== undefined
+      || workflowFailedRoles({ outcome: state.outcome?.outcome ?? null, tasks, agents }).length > 0
       || (!state.manualClose && agents.some(agent => agent.runtimeIssue?.status === 'unknown'
         || (state.outcome === undefined && agent.runtimeIssue?.status === 'stopped')))
       || (state.proposedLearning.length > 0 && !decisionComplete),

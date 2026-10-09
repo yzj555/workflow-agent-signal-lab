@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
-import { bindWorkflowView, WORKFLOW_PRESET_ID } from '../lib/workflow-native-seats.js'
+import { bindWorkflowView, nativeSubagentStatus, WORKFLOW_PRESET_ID } from '../lib/workflow-native-seats.js'
 
 function selection(initial = { byId: {} }) {
   let value = initial
@@ -17,6 +17,38 @@ function selection(initial = { byId: {} }) {
 function selected(preset, current = 'session-a') {
   return { current, byId: { [current]: { projectionValues: { agentPreset: preset } } } }
 }
+
+test('a discovered one-shot child with absent lifecycle or completion evidence remains unknown', () => {
+  assert.deepEqual(nativeSubagentStatus({ mode: 'one-shot' }), { status: '状态未确认', tone: 'waiting' })
+  assert.deepEqual(nativeSubagentStatus({ mode: 'one-shot', running: false }), { status: '状态未确认', tone: 'waiting' })
+  assert.deepEqual(nativeSubagentStatus({ mode: 'one-shot', lastTurnCompleted: true }), { status: '状态未确认', tone: 'waiting' })
+})
+
+test('completion requires a stopped one-shot child with a normally closed turn', () => {
+  assert.deepEqual(nativeSubagentStatus({ mode: 'one-shot', running: false, lastTurnCompleted: true }),
+    { status: '已完成', tone: 'done' })
+})
+
+test('current live activity takes precedence over an older completed turn', () => {
+  assert.deepEqual(nativeSubagentStatus({ mode: 'one-shot', running: true, lastTurnCompleted: true }), { status: '运行中', tone: 'active' })
+  assert.deepEqual(nativeSubagentStatus({ activity: 'running' }), { status: '运行中', tone: 'active' })
+})
+
+test('an unclosed durable turn is not completion or current process-exit proof', () => {
+  assert.deepEqual(nativeSubagentStatus({ mode: 'one-shot', running: false, openTurn: true, lastTurnCompleted: true }),
+    { status: '上次运行未闭合', tone: 'waiting' })
+})
+
+test('abnormal child closure is stopped, not business QA failure or normal completion', () => {
+  for (const mode of ['one-shot', 'continuable']) assert.deepEqual(nativeSubagentStatus({ mode, running: false, lastTurnCompleted: false }),
+    { status: '已停止（未正常结束）', tone: 'waiting' })
+})
+
+test('known continuable idle differs from missing or unknown lifecycle modes', () => {
+  assert.deepEqual(nativeSubagentStatus({ mode: 'continuable', running: false }), { status: '空闲', tone: 'waiting' })
+  for (const mode of [undefined, 'unknown']) assert.deepEqual(nativeSubagentStatus({ mode, running: false, lastTurnCompleted: true }),
+    { status: '状态未确认', tone: 'waiting' })
+})
 
 test('native workflow tab follows explicit preset selection, not text or the presence of a task', () => {
   const source = selection()
@@ -58,6 +90,42 @@ test('a failed initial native seat registration does not leak its selection subs
   assert.equal(source.observers, 0)
 })
 
+test('SDK2 main binding, not a nonexistent catalog current field, chooses the optional tab', () => {
+  const catalog = selection({ byId: {
+    a: { projectionValues: { agentPreset: WORKFLOW_PRESET_ID } },
+    b: { projectionValues: { agentPreset: 'standard' } },
+  } })
+  const main = selection({ key: undefined })
+  let mounts = 0, releases = 0
+  const dispose = bindWorkflowView(catalog, () => { mounts++; return () => releases++ }, main)
+  assert.equal(mounts, 0)
+  main.set({ key: 'a' }); assert.equal(mounts, 1)
+  main.set({ key: 'b' }); assert.equal(releases, 1)
+  main.set({ key: 'a' }); assert.equal(mounts, 2)
+  catalog.set({ byId: {} }); assert.equal(releases, 2)
+  main.set({ key: undefined }); assert.equal(mounts, 2)
+  dispose(); dispose()
+  assert.equal(main.observers, 0); assert.equal(catalog.observers, 0)
+})
+
+test('SDK2 main binding is authoritative even when a stale legacy current exists', () => {
+  const catalog = selection(selected(WORKFLOW_PRESET_ID))
+  const main = selection({ key: undefined })
+  let mounts = 0
+  const dispose = bindWorkflowView(catalog, () => { mounts++; return () => {} }, main)
+  assert.equal(mounts, 0)
+  main.set({ key: {} }); assert.equal(mounts, 0)
+  main.set({ key: 'session-a' }); assert.equal(mounts, 1)
+  dispose()
+})
+
+test('SDK2 initial registration failure releases both public subscriptions', () => {
+  const catalog = selection(selected(WORKFLOW_PRESET_ID))
+  const main = selection({ key: 'session-a' })
+  assert.throws(() => bindWorkflowView(catalog, () => { throw new Error('slot unavailable') }, main), /slot unavailable/)
+  assert.equal(main.observers, 0); assert.equal(catalog.observers, 0)
+})
+
 test('client presentation uses additive native seats and no independent composer, portal, or hard-coded palette', async () => {
   const runtime = await readFile(new URL('../src/client/runtime.ts', import.meta.url), 'utf8')
   const requirements = await readFile(new URL('../src/client/requirements-gate-composer.ts', import.meta.url), 'utf8')
@@ -80,6 +148,13 @@ test('client presentation uses additive native seats and no independent composer
   assert.match(runtime, /priority: -10/)
   assert.match(runtime, /ctx\.slots\.inject\('conversation\.view'/)
   assert.match(runtime, /bindWorkflowView\(ctx\.sessions\.list/)
+  assert.match(runtime, /ctx\.uiSession\.adapter\.current/)
+  assert.match(runtime, /useSessionStatus\(state => state\.get\(sessionId\)\?\.pendingInteraction\)/)
+  assert.match(runtime, /projectionValues\?\.subagentCatalog/)
+  assert.match(runtime, /nativeSubagentStatus\(/)
+  assert.match(runtime, /summary\?\.projectionValues\?\.subagentTiming/)
+  assert.match(runtime, /apply\(ctx: WorkflowClientContext\)/)
+  assert.doesNotMatch(runtime, /useSessionPendingInteraction/)
   assert.match(runtime, /WorkflowStatus, \{ projection, placement: 'header' \}/)
   assert.doesNotMatch(runtime, /createPortal|name: 'conversation\.input\.dock'|name: 'details'|name: 'conversation'/)
   assert.match(surface, /@deepseek-ai\/dsh-client-ui-primitives/)

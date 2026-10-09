@@ -1,5 +1,5 @@
 import { createElement as h, useRef, useState } from 'react'
-import { Button, DisclosureRow, IconBranchOutline16, MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, DisclosureRow, IconBranchOutlineMedium as IconBranchOutline16, MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 import { decideManualRecovery, discussManualRecovery } from './manual-recovery-gate-contract.ts'
 import type { ManualRecoveryWait } from './manual-recovery-gate-contract.ts'
 import { KEEP_UNKNOWN_LABEL, MANUAL_CLOSE_LABEL } from '../workflow-ui-contract.ts'

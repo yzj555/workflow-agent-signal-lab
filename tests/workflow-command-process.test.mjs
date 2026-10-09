@@ -67,7 +67,8 @@ test('official ToolRuntime + sandboxed PowerShell + local subprocess attest a no
   assert.equal(result.value.exitCode, 0)
   assert.match(result.value.stdout.text, /controlled passing command/)
   // The decorator is local to the official tool's captured context, not the Host service.
-  const unrelated = await f.ctx.shell.run(f.ctx.shell.resolve({ command: 'Write-Output scope-unchanged', workdir: f.cwd }))
+  const execution = await f.ctx.shell.execute(f.ctx.shell.resolve({ command: 'Write-Output scope-unchanged', workdir: f.cwd }))
+  const unrelated = await execution.result()
   assert.equal(unrelated.exitCode, 0); assert.match(unrelated.stdout.text, /scope-unchanged/)
 })
 

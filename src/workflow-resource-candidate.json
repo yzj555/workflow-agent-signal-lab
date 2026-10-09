@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "status": "candidate-not-activated",
+  "dsh": "0.2.0-rc.2",
+  "scope": "supervised-local-l0-l1",
+  "engineConfig": {
+    "rootTurnNoProgressMs": 180000,
+    "rootRecoveryNoProgressMs": 120000,
+    "rootCancelGraceMs": 15000,
+    "userWaitProbeMs": 30000,
+    "childAdmissionMs": 30000,
+    "childNoProgressMs": 180000,
+    "childMaxRunMs": 1200000,
+    "childReportGraceMs": 15000,
+    "childCancelGraceMs": 15000,
+    "commandTimeoutMs": 120000,
+    "commandExitGraceMs": 15000,
+    "hostAdmissionEnabled": true,
+    "hostMaxActiveRoots": 2,
+    "hostMaxRoleExecutions": 4,
+    "runBudgetEnabled": true,
+    "runBudgetScope": "all",
+    "runModelRequests": 240,
+    "runCommands": 40,
+    "runTimeBudgetEnabled": true,
+    "runActiveMs": 1800000
+  },
+  "frozenBounds": {
+    "runTopups": 3,
+    "controlRequestsPerGrant": 12,
+    "controlRequestsPerTurn": 3,
+    "closedRunHandoffRequests": 3,
+    "automaticSameScopeReworks": 1,
+    "parallelRolesPerCurrentProjectGraph": 2,
+    "checkpointFilesPerImplementation": 100,
+    "checkpointBytesPerImplementation": 67108864,
+    "workspaceFileBytes": 16777216,
+    "journalExecutionEvents": 9000,
+    "journalExecutionBytes": 14680064,
+    "journalHardEvents": 10000,
+    "journalHardBytes": 16777216
+  },
+  "hostConcurrency": {
+    "enforced": true,
+    "scope": "workflow-agent-preset-only",
+    "maxActiveRoots": 2,
+    "maxRoleExecutions": 4,
+    "unconfirmedRolesOccupySlots": true,
+    "nativeAdministrativeCloseReleasesWithoutInventingExitProof": true
+  },
+  "activationRequires": [
+    "Completed Host-wide admission, cancellation and cold-unknown regression for this exact candidate",
+    "Completed performance and sustained-accounting evidence at the selected load",
+    "Explicit deployment scope and approval; never retrofit historical unmetered runs"
+  ],
+  "limitations": [
+    "This file is a candidate policy, not a loaded Cordis profile or production approval.",
+    "Request and command counts are not token or currency billing caps.",
+    "Requirement ingress and native auxiliary model work are not charged to a formal run account.",
+    "Active time is the union of funded execution intervals, excluding root-only user waiting.",
+    "Host admission limits this preset's root streams and role execution ranges, not other presets or native auxiliary model work.",
+    "Root stream slots last until iterator settlement; old unknown role/command ranges remain counted until proven exit or explicit existing native disposition.",
+    "Per-run graph width and Host admission are not memory, total disk, provider-side billing or OS process limits."
+  ]
+}

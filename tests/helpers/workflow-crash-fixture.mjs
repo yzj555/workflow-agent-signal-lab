@@ -87,8 +87,10 @@ export async function fixture(t, name, scenario = name) {
     if (process.env.WORKFLOW_CRASH_EVIDENCE_DIR) await writeFile(join(process.env.WORKFLOW_CRASH_EVIDENCE_DIR, name + '.json'),
       JSON.stringify(evidence, null, 2), { flag: 'wx' })
   })
+  let cuts = 0
   async function cut(active) {
-    await save('before-kill', active.ready)
+    const observed = await active.request('inspect')
+    await save('before-kill', observed)
     const markerPath = join(directory, 'journal/writer.lock')
     const marker = await readFile(markerPath, 'utf8')
     assert.equal(JSON.parse(marker).pid, active.child.pid)
@@ -108,8 +110,9 @@ export async function fixture(t, name, scenario = name) {
     // original owner marker; never delete it and never address a live profile.
     assert.match(relative(await realpath(tmpdir()), await realpath(directory)), /^workflow-crash-matrix-[^\\/]+$/u)
     assert.equal(JSON.parse(await readFile(join(directory, 'fixture.json'), 'utf8')).token, token)
-    await mkdir(join(directory, 'retired-owner'))
-    await rename(markerPath, join(directory, 'retired-owner/writer.lock'))
+    await mkdir(join(directory, 'retired-owner'), { recursive: true })
+    const retiredName = ++cuts === 1 ? 'writer.lock' : `writer-${cuts}.lock`
+    await rename(markerPath, join(directory, 'retired-owner', retiredName))
     await save('stale-owner-refused-and-explicitly-archived', { pid: active.child.pid, marker: JSON.parse(marker), refusal: blocked.ready })
     return crashed
   }

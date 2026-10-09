@@ -28,7 +28,7 @@ test('development linker carries the same native capability packages', async () 
   const linker = await readFile(join(root, 'scripts/link-dsh-dev.ps1'), 'utf8')
   const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
   const dshVersion = manifest.peerDependencies['@deepseek-ai/dsh-agent']
-  assert.equal(dshVersion, '0.1.5-rc.1')
+  assert.equal(dshVersion, '0.2.0-rc.2')
   for (const packageName of [
     '@deepseek-ai/dsh-tool-fs',
     '@deepseek-ai/dsh-tool-fs-search',
@@ -37,5 +37,12 @@ test('development linker carries the same native capability packages', async () 
   ]) {
     assert.match(linker, new RegExp(packageName.replaceAll('/', '\\/')))
     assert.equal(manifest.peerDependencies[packageName], dshVersion)
+    assert.equal(manifest.devDependencies[packageName], dshVersion)
   }
+  for (const packageName of ['@deepseek-ai/dsh-agent-preset-registry', '@deepseek-ai/dsh-agent-preset',
+    '@deepseek-ai/dsh-app-boot', '@deepseek-ai/cordis-plugin-include']) {
+    assert.match(linker, new RegExp(packageName.replaceAll('/', '\\/')))
+    assert.ok(manifest.devDependencies[packageName])
+  }
+  assert.equal(manifest.peerDependencies['@deepseek-ai/dsh-agent-presets'], undefined)
 })

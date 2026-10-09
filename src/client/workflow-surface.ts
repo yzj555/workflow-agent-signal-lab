@@ -1,7 +1,7 @@
 import { createElement as h, useState } from 'react'
 import {
-  DisclosureRow, IconAgentPresetOutline16, IconBranchOutline16,
-  IconCheckOutline14, IconRefreshOutline16, StateDot,
+  DisclosureRow, IconAgentPresetOutlineMedium as IconAgentPresetOutline16, IconBranchOutlineMedium as IconBranchOutline16,
+  IconCheckOutlineMedium as IconCheckOutline14, IconRefreshOutlineMedium as IconRefreshOutline16, StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { AgentLine, LearningLine, ManualCloseRecord, PlanMilestone, WorkflowPlanProjection, WorkflowProjection } from './workflow-display.ts'
 import { workflowStatusLabel } from './workflow-display.ts'

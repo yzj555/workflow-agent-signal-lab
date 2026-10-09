@@ -294,8 +294,12 @@ test('child spawn is included only after durable time admission and cannot slip 
     if (row.budgets?.accounts[0].time.reservedMs > 0) throw new Error('time reservation disk failure')
     return put(key, row)
   }
-  await assert.rejects(h.advance(), /storage|时长|预算/)
+  // Shared-store revocation may now abort admission before its original write
+  // rejection returns. Either path must retain the storage fault and no spawn.
+  await assert.rejects(h.advance(), /storage|时长|预算|持久状态无法确认/)
   assert.equal(h.calls.filter(c => c.operation === 'start').length, 0)
+  assert.equal(h.journal.readFault().kind, 'storage-write')
+  assert.equal(h.table.get(h.root.id).budgets.accounts[0].time.reservedMs, 0)
 })
 
 test('explicit time-only topup preserves spent time, freezes exact numbers, and requires fresh native input', async t => {

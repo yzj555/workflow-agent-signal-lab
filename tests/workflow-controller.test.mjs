@@ -368,7 +368,10 @@ test('plain Agent completion without a structured report is not verification', a
   await f.settle(f.child('author'))
   assert.equal(f.snapshot().run.agents[0].status, 'interrupted')
   assert.equal(f.snapshot().run.ledger.pass, 0)
-  assert.match((await f.advance()).next, /暂停/)
+  assert.equal(f.snapshot().run.needsUser, true)
+  const before = f.snapshot()
+  await assert.rejects(f.advance(), /未正常完成的角色报告/)
+  assert.deepEqual(f.snapshot(), before, 'runtime failure cannot silently retry or become business rework')
 })
 
 test('cancel revokes child capability before drain and does not delete saved history', async t => {

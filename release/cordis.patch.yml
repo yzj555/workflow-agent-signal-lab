@@ -1,0 +1,15 @@
+# Installed but inactive until an explicitly configured Profile enables these
+# rows and registers preset/ as an additional system preset root. Installation
+# must not change credentials, the default Agent, other plugins or old budgets.
+- insert:
+    - id: workflow-release-guard
+      name: '@local/workflow-agent-signal-lab/profile-guard'
+      disabled: true
+
+    - id: workflow-agent-signal-lab-ui
+      name: '@local/workflow-agent-signal-lab'
+      disabled: true
+
+    - id: workflow-agent-runtime
+      name: '@local/workflow-agent-signal-lab/workflow-engine'
+      disabled: true

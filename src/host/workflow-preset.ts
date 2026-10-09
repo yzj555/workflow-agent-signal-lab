@@ -1,8 +1,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { installWorkflowChild } from './workflow-control.ts'
-import type {} from '@deepseek-ai/dsh-agent-presets'
-import type {} from '@deepseek-ai/dsh-agent-presets/types'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry/types'
 import type {} from '@deepseek-ai/dsh-commands'
 import { ROOT_TOOLS } from '../workflow-pilot-contract.ts'
 import { registerRootTools } from './workflow-tools.ts'
@@ -17,7 +17,13 @@ export const inject = ['workflowController', 'tools', 'agents', 'agentPresets', 
 export function apply(ctx: Context): void {
   const controller = ctx.workflowController
   registerRootTools(ctx, controller)
-  ctx.tools.guard(exec => controller.guard(exec.agent, exec.name, exec.arguments))
+  ctx.tools.guard(exec => {
+    if (exec.agent && (controller.ownsChild(exec.agent.id) || isWorkflowRootAgent(ctx, exec.agent))) {
+      const release = ctx.get('workflowReleaseReady') as { assertReady?: () => void } | undefined
+      release?.assertReady?.()
+    }
+    return controller.guard(exec.agent, exec.name, exec.arguments)
+  })
   const bindings = new WeakMap<Agent, () => void>()
   const syncBinding = (agent: Agent) => {
     if (controller.ownsChild(agent.id)) {
@@ -32,6 +38,10 @@ export function apply(ctx: Context): void {
       return
     }
     if (bindings.has(agent)) return
+    // A distributed 0.2 release remains closed until its actual declaration
+    // subtree has been audited after the Host controller became available.
+    const release = ctx.get('workflowReleaseReady') as { assertReady?: () => void } | undefined
+    release?.assertReady?.()
     controller.bindRoot(agent)
     // Keep the preset's native capability substrate in the scope chain so an
     // official delegated child can inherit it and then narrow to its role.
@@ -42,7 +52,26 @@ export function apply(ctx: Context): void {
     const undoView = installWorkflowModelView(agent.ctx, agent, 'root', () => isWorkflowRootAgent(ctx, agent), undefined,
       () => controller.rootModelTools(agent))
     const undoBudget = installWorkflowModelBudget(agent.ctx, agent, controller, () => isWorkflowRootAgent(ctx, agent))
-    const commandFiber = agent.ctx.inject(['commands'], commandCtx => { commandCtx.commands.register({
+    const commandFiber = agent.ctx.inject(['commands'], commandCtx => {
+      commandCtx.commands.register({
+        name: 'workflow-resources', description: '核对 Host 并发占位，或停止当前工作流（不调用模型）',
+        input: { hint: '留空查看；stop 仅停止当前会话的工作流' },
+        async handler(invocation) {
+          if (invocation.agent !== agent || !isWorkflowRootAgent(ctx, agent)) return { kind: 'error', text: '命令不属于当前工作流 Agent' }
+          try { return { kind: 'success', text: await controller.resourcesCommand(agent, invocation.rawInput, invocation.signal) } }
+          catch (error) { return { kind: 'error', text: error instanceof Error ? error.message : String(error) } }
+        },
+      })
+      commandCtx.commands.register({
+        name: 'workflow-capacity', description: '核对日志容量暂停与后台停止状态（不调用模型）',
+        input: { hint: '留空查看；stop 请求停止并核对已记录执行' },
+        async handler(invocation) {
+          if (invocation.agent !== agent || !isWorkflowRootAgent(ctx, agent)) return { kind: 'error', text: '命令不属于当前工作流 Agent' }
+          try { return { kind: 'success', text: await controller.capacityCommand(agent, invocation.rawInput, invocation.signal) } }
+          catch (error) { return { kind: 'error', text: error instanceof Error ? error.message : String(error) } }
+        },
+      })
+      commandCtx.commands.register({
       name: 'workflow-budget', description: '核对工作流预算，或通过原生确认申请补额／结束（不调用模型）',
       input: { hint: '留空查看；topup 申请补额；end 申请结束' },
       async handler(invocation) {
@@ -58,8 +87,8 @@ export function apply(ctx: Context): void {
   }
   // Synchronous failure here vetoes native Agent publication. Do not defer
   // permission installation to a later promise or to the first model message.
-  ctx.on('agent/created', ({ agent }) => syncBinding(agent))
-  ctx.on('agent/disposed', ({ agent }) => bindings.get(agent)?.())
+  ctx.on('agent/created', ({ agent }) => { syncBinding(agent); return undefined })
+  ctx.on('agent/disposed', ({ agent }) => { bindings.get(agent)?.(); return undefined })
   // Official blank-session selection re-links the same Agent; it does not
   // emit agent/created again. Bind on entry and release exact local effects
   // on exit, without touching another Agent or the shared preset composition.

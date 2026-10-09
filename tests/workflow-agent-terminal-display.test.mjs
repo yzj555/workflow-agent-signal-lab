@@ -7,6 +7,36 @@ import { fixture, memoryTable } from './helpers/workflow-fixture.mjs'
 const stages = ['需求确认', '计划与拆解', '实现', '验证', '独立审查', '交付', '沉淀'].map(name => ({ name, purpose: name }))
 const reason = '整轮预算耗尽，官方回收已完成；需要决定如何继续。请使用 /workflow-budget end。'
 const project = value => displayWorkflowState({ status: 'ready', snapshot: value }, [], stages)
+
+test('an interrupted current role without a valid report is actionable in both durable projection and UI', async t => {
+  const f = fixture(), journal = new WorkflowJournal(memoryTable())
+  t.after(() => journal.close())
+  await journal.commit({ rootSessionId: f.rootSessionId, expectedRevision: 0, events: [
+    ...f.initial(), f.approve(), f.readyTask(), f.runTask(), f.assign(),
+    f.event('task/status-changed', { taskId: 'normalize', taskVersion: 1,
+      expectedStatus: 'running', status: 'failed', reason: '没有有效的角色报告' }),
+    f.event('agent/settled', { assignmentId: 'assignment-normalize', outcome: 'interrupted', summary: '原生模型调用异常' }),
+  ] })
+  const value = journal.readSnapshot(f.rootSessionId), before = structuredClone(value), view = project(value)
+  assert.equal(value.run.needsUser, true)
+  assert.equal(view.needsUser, true); assert.equal(view.badge, '角色执行异常')
+  assert.match(view.now, /实现 Agent 未正常完成/u)
+  assert.match(view.summary, /不等于业务验收失败/u)
+  assert.match(view.next, /停止本轮.*重新确认/u)
+  assert.equal(value.run.outcome, null); assert.equal(value.run.ledger.fail, 0)
+  assert.equal(value.run.latestReturn, null); assert.deepEqual(value, before)
+
+  // A later completed/current version or terminal run must not inherit a historical prompt.
+  for (const update of [
+    run => { run.tasks[0].version++ }, run => { run.tasks[0].status = 'completed' },
+    run => { run.outcome = 'CANCELLED' }, run => { run.agents[0].status = 'idle' },
+  ]) {
+    const historical = structuredClone(value); update(historical.run)
+    assert.notEqual(project(historical).badge, '角色执行异常')
+  }
+  const invalidated = structuredClone(value); invalidated.run.tasks[0].status = 'invalidated'
+  assert.equal(project(invalidated).badge, '角色执行异常', 'a report invalidated by abnormal native exit is not a success')
+})
 async function snapshot(t, outcome = null, status = 'stopped') {
   const f = fixture(), journal = new WorkflowJournal(memoryTable())
   t.after(() => journal.close())

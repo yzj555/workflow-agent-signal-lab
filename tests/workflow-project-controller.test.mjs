@@ -3,6 +3,8 @@ import test from 'node:test'
 import { access, mkdir, mkdtemp, readFile, writeFile, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Context } from '@deepseek-ai/cordis'
+import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import { WorkflowJournal } from '../lib/workflow-journal.js'
 import { displayWorkflowState } from '../lib/workflow-display.js'
 import {
@@ -16,10 +18,41 @@ import {
 import { memoryTable } from './helpers/workflow-fixture.mjs'
 import { childClock, childConfig, flushChild } from './helpers/workflow-child-clock.mjs'
 import { executeCheck } from './helpers/workflow-command-fixture.mjs'
+import { padHistory, recoveryPair } from './helpers/workflow-capacity-fixture.mjs'
 
 const signal = new AbortController().signal
 const stages = ['需求确认', '计划与拆解', '实现', '验证', '独立审查', '交付', '沉淀'].map(name => ({ name, purpose: name }))
 const display = snapshot => displayWorkflowState({ status: 'ready', snapshot }, [], stages)
+const fileByteLimit = 16 * 1024 * 1024
+
+test('capacity reached by the checkpoint commit denies native file dispatch and leaves the original file intact', async t => {
+  const h = await fixture(t)
+  await h.setup(); await h.advance()
+  const child = h.child('implementation')
+  await writeFile(join(h.workspace, 'src/app.js'), 'original file', 'utf8')
+  // Single capture is the final normal commit. Fill by complete prior ingress
+  // pairs and, when necessary, one settled recovery pair up to revision 8999.
+  let revision = padHistory(h.table, h.root.id, 8997)
+  if (revision === 8997) {
+    await h.journal.commit({ rootSessionId: h.root.id, expectedRevision: revision, events: recoveryPair(h.snapshot()) })
+    revision = h.snapshot().revision
+  }
+  if (revision === 8998) {
+    const pair = recoveryPair(h.snapshot())
+    await h.journal.commit({ rootSessionId: h.root.id, expectedRevision: revision, events: [pair[0]] })
+  }
+  assert.equal(h.snapshot().revision, 8999)
+  let dispatched = false
+  await assert.rejects(h.controller.executeNativeTool(child, 'write', { file_path: 'src/app.js', content: 'replacement' }, async () => {
+    dispatched = true
+    await writeFile(join(h.workspace, 'src/app.js'), 'replacement', 'utf8')
+    return { isError: false, content: [] }
+  }), /容量|派发/)
+  assert.equal(dispatched, false)
+  assert.equal(await readFile(join(h.workspace, 'src/app.js'), 'utf8'), 'original file')
+  assert.ok(h.snapshot().capacity)
+  assert.equal(h.snapshot().run.outcome, null)
+})
 
 function proposal(expectedRevision, changeClass = 'localized') {
   return {
@@ -101,7 +134,7 @@ async function fixture(t, options = {}) {
     },
     notify() {},
   }
-  controller = new WorkflowTextController(journal, artifacts, driver, undefined, options.childConfig, options.childClock, options.commandConfig)
+  controller = new WorkflowTextController(journal, artifacts, driver, undefined, options.childConfig, options.childClock, options.commandConfig, {}, options.hostAdmissionConfig)
   controller.bindRoot(root)
   t.after(async () => {
     if (options.expectUnknownExit) await assert.rejects(controller.close(), /卸载回收未在期限内确认/)
@@ -154,6 +187,175 @@ async function fixture(t, options = {}) {
   }
   return { base, workspace, controller, root, journal, table, artifacts, driver, live, calls, questions, snapshot, revision, setup, advance, child, settle, implement }
 }
+
+test('resource guard: oversized UTF-8 write is rejected before native dispatch or checkpoint publication', async t => {
+  const f = await fixture(t)
+  await f.setup(); await f.advance()
+  const engineer = f.child('implementation'), target = join(f.workspace, 'src/app.js')
+  await writeFile(target, 'original\n')
+  const before = f.snapshot()
+  const content = '界'.repeat(Math.floor(fileByteLimit / 3) + 1)
+  assert.ok(content.length < fileByteLimit && Buffer.byteLength(content) > fileByteLimit)
+  let dispatched = false
+  await assert.rejects(f.controller.executeNativeTool(engineer, 'write', { file_path: 'src/app.js', content }, async () => {
+    dispatched = true
+    throw new Error('oversized request reached the native filesystem')
+  }), /16 MiB/)
+  assert.equal(dispatched, false)
+  assert.equal(await readFile(target, 'utf8'), 'original\n')
+  assert.deepEqual(f.snapshot(), before)
+  assert.deepEqual(await readdir(f.artifacts.checkpointDirectory), [])
+})
+
+test('Host admission rejects an entire parallel verification wave before either role is assigned', async t => {
+  const f = await fixture(t, { hostAdmissionConfig: { hostAdmissionEnabled: true, hostMaxActiveRoots: 2, hostMaxRoleExecutions: 2 } })
+  await f.setup(); await f.implement()
+  const release = f.controller.hostAdmission.reserveRoles('another-root', ['another-owned-execution'])
+  try {
+    const before = f.calls.filter(call => call.operation === 'start').length
+    await assert.rejects(f.advance(), /并发名额不足/)
+    assert.equal(f.calls.filter(call => call.operation === 'start').length, before)
+    assert.equal(f.snapshot().run.agents.filter(agent => ['engineering-test', 'code-review'].includes(agent.taskId)).length, 0)
+    assert.equal(f.controller.hostAdmission.view().roleExecutions, 1)
+    release()
+    assert.equal(f.calls.filter(call => call.operation === 'start').length, before)
+    await assert.rejects(f.advance(), /并发不足暂停/)
+    f.controller.observeBudgetTurn(f.root, { type: 'turn/start' })
+    f.controller.observeBudgetTurn(f.root, { type: 'user/message', data: { source: { kind: 'user' } } })
+    await f.advance()
+    assert.equal(f.calls.filter(call => call.operation === 'start').length, before + 2)
+    assert.equal(f.controller.hostAdmission.view().roleExecutions, 2)
+  } finally { release() }
+})
+
+test('resource guard: replace-all expansion is rejected before native dispatch or checkpoint publication', async t => {
+  const f = await fixture(t)
+  await f.setup(); await f.advance()
+  const engineer = f.child('implementation'), target = join(f.workspace, 'src/app.js')
+  const original = 'a'.repeat(1024 * 1024)
+  await writeFile(target, original)
+  const before = f.snapshot()
+  let dispatched = false
+  await assert.rejects(f.controller.executeNativeTool(engineer, 'edit', {
+    file_path: 'src/app.js', old_string: 'a', new_string: 'b'.repeat(17), replace_all: true,
+  }, async () => {
+    dispatched = true
+    throw new Error('oversized edit reached the native filesystem')
+  }), /16 MiB/)
+  assert.equal(dispatched, false)
+  assert.equal(await readFile(target, 'utf8'), original)
+  assert.deepEqual(f.snapshot(), before)
+  assert.deepEqual(await readdir(f.artifacts.checkpointDirectory), [])
+})
+
+test('resource guard: checkpoint file-count refusal does not leave an unreferenced backup', async t => {
+  const f = await fixture(t)
+  await f.setup(); await f.advance()
+  const engineer = f.child('implementation')
+  for (let index = 0; index < 100; index++) {
+    const path = `src/file-${index}.txt`
+    await f.controller.executeNativeTool(engineer, 'write', { file_path: path, content: '' }, async () => {
+      await writeFile(join(f.workspace, path), '')
+      return { isError: false, value: {}, content: [] }
+    })
+  }
+  const extra = join(f.workspace, 'src/extra.txt')
+  await writeFile(extra, 'must not be backed up or changed')
+  const before = f.snapshot()
+  let dispatched = false
+  await assert.rejects(f.controller.executeNativeTool(engineer, 'write', { file_path: 'src/extra.txt', content: '' }, async () => {
+    dispatched = true
+    throw new Error('file-count overflow reached native filesystem')
+  }), /100/)
+  assert.equal(dispatched, false)
+  assert.deepEqual(f.snapshot(), before)
+  assert.equal(await readFile(extra, 'utf8'), 'must not be backed up or changed')
+  assert.deepEqual(await readdir(f.artifacts.checkpointDirectory), [])
+})
+
+test('resource guard: original checkpoint bytes permit exactly 64 MiB and reject the next byte before backup', async t => {
+  const f = await fixture(t)
+  await f.setup(); await f.advance()
+  const engineer = f.child('implementation')
+  for (let index = 0; index < 4; index++) {
+    const path = `src/bounded-${index}.txt`
+    await writeFile(join(f.workspace, path), Buffer.alloc(fileByteLimit, 65 + index))
+    await f.controller.executeNativeTool(engineer, 'write', { file_path: path, content: 'small' }, async () => {
+      await writeFile(join(f.workspace, path), 'small')
+      return { isError: false, value: {}, content: [] }
+    })
+  }
+  const backups = (await readdir(f.artifacts.checkpointDirectory)).sort()
+  assert.equal(backups.length, 4)
+  const before = f.snapshot(), extra = join(f.workspace, 'src/one-more-byte.txt')
+  await writeFile(extra, 'z')
+  let dispatched = false
+  await assert.rejects(f.controller.executeNativeTool(engineer, 'write', { file_path: 'src/one-more-byte.txt', content: '' }, async () => {
+    dispatched = true
+    throw new Error('checkpoint byte overflow reached native filesystem')
+  }), /64 MiB/)
+  assert.equal(dispatched, false)
+  assert.deepEqual(f.snapshot(), before)
+  assert.equal(await readFile(extra, 'utf8'), 'z')
+  assert.deepEqual((await readdir(f.artifacts.checkpointDirectory)).sort(), backups)
+})
+
+test('resource guard: exactly 16 MiB UTF-8 output is accepted by the real native filesystem and remains verifiable', async t => {
+  const f = await fixture(t)
+  await f.setup(); await f.advance()
+  const ctx = new Context()
+  await ctx.plugin(LocalFileSystem, { cwd: f.workspace })
+  t.after(() => ctx.fiber.dispose())
+  const engineer = f.child('implementation'), target = await ctx.fs.resolve('src/app.js')
+  const content = 'a'.repeat(fileByteLimit - 3) + '界'
+  assert.equal(Buffer.byteLength(content), fileByteLimit)
+  await f.controller.executeNativeTool(engineer, 'write', { file_path: 'src/app.js', content }, async () => ({
+    isError: false, value: await ctx.fs.writeText(target, content), content: [],
+  }))
+  const state = f.journal.readRunState(f.root.id, f.snapshot().run.runId)
+  assert.equal(state.checkpoints['implementation@1'].files['src/app.js'].after.bytes, fileByteLimit)
+  assert.equal((await readFile(join(f.workspace, 'src/app.js'))).byteLength, fileByteLimit)
+  assert.equal(f.snapshot().run.ledger.hardOutcome, 'PENDING', 'A bounded write is not acceptance')
+})
+
+for (const row of [
+  { label: 'CRLF, BOM and literal dollar replacement', before: '\ufeffa\r\nb\r\n', old: 'a\r\nb', replacement: '界\r\n$&', expected: '界\r\n$&\r\n' },
+  { label: 'Unicode replace-all', before: '甲 甲\n', old: '甲', replacement: '🙂', replaceAll: true, expected: '🙂 🙂\n' },
+  { label: 'non-overlapping matches and deletion', before: 'aaaa\n', old: 'aa', replacement: '', replaceAll: true, expected: '\n' },
+  { label: 'lone CR at replacement boundary', before: 'x\ny\n', old: 'x', replacement: '\r', expected: '\r\ny\n' },
+]) {
+  test(`resource guard: bounded edit agrees with native ${row.label}`, async t => {
+    const f = await fixture(t)
+    await f.setup(); await f.advance()
+    const ctx = new Context()
+    await ctx.plugin(LocalFileSystem, { cwd: f.workspace })
+    t.after(() => ctx.fiber.dispose())
+    const target = await ctx.fs.resolve('src/app.js'), engineer = f.child('implementation')
+    await writeFile(join(f.workspace, 'src/app.js'), row.before)
+    await f.controller.executeNativeTool(engineer, 'edit', {
+      file_path: 'src/app.js', old_string: row.old, new_string: row.replacement, replace_all: row.replaceAll ?? false,
+    }, async () => ({ isError: false, value: await ctx.fs.editText(target, {
+      oldString: row.old, newString: row.replacement, replaceAll: row.replaceAll ?? false,
+    }), content: [] }))
+    assert.equal(await readFile(join(f.workspace, 'src/app.js'), 'utf8'), row.expected)
+    const state = f.journal.readRunState(f.root.id, f.snapshot().run.runId)
+    assert.equal(state.checkpoints['implementation@1'].files['src/app.js'].after.bytes, Buffer.byteLength(row.expected))
+  })
+}
+
+test('resource guard: CRLF restoration cannot expand an apparently bounded edit past 16 MiB', async t => {
+  const f = await fixture(t)
+  await f.setup(); await f.advance()
+  const target = join(f.workspace, 'src/app.js')
+  await writeFile(target, 'x\r\n')
+  const before = f.snapshot()
+  await assert.rejects(f.controller.executeNativeTool(f.child('implementation'), 'edit', {
+    file_path: 'src/app.js', old_string: 'x', new_string: '\n'.repeat(fileByteLimit / 2),
+  }, async () => { throw new Error('CRLF overflow was dispatched') }), /16 MiB/)
+  assert.deepEqual(f.snapshot(), before)
+  assert.equal(await readFile(target, 'utf8'), 'x\r\n')
+  assert.deepEqual(await readdir(f.artifacts.checkpointDirectory), [])
+})
 
 test('only an exact supervised native command result can become check evidence', async t => {
   const f = await fixture(t)

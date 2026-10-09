@@ -1,5 +1,5 @@
 import { createElement as h, useRef, useState } from 'react'
-import { Button, IconBranchOutline16, MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, IconBranchOutlineMedium as IconBranchOutline16, MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 import { decideBudget, discussBudget } from './budget-gate-contract.ts'
 import type { BudgetWait } from './budget-gate-contract.ts'
 import { BUDGET_KEEP_LABEL, BUDGET_TOPUP_LABEL } from '../workflow-ui-contract.ts'

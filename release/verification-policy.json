@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "dsh": "0.2.0-rc.2",
+  "platform": "win32",
+  "arch": "x64",
+  "node": "v26.1.0",
+  "expectedTestFiles": 50,
+  "expectedTests": 588,
+  "zeroSkipsRequired": true,
+  "productionReady": false
+}

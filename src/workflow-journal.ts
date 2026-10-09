@@ -19,6 +19,8 @@ import { emptyRunBudget, runBudgetLimitsSchema, runBudgetsSchema, RunBudgetExcee
   RUN_TIME_SLICE_MS, timeUsed } from './workflow-run-budget.ts'
 import type { BudgetRequest, RunBudgetAccount, RunBudgetLimits, RunBudgetResource, RunBudgets } from './workflow-run-budget.ts'
 import { assertBudgetAction } from './workflow-budget-recovery.ts'
+import { capacitySettlement, journalCapacity, JOURNAL_CAPACITY_MESSAGE,
+  JOURNAL_HARD_EVENTS, JOURNAL_HARD_BYTES, JOURNAL_BATCH_EVENTS, JOURNAL_BATCH_BYTES } from './workflow-journal-capacity.ts'
 
 export { workflowSnapshotSchema } from './workflow-view.ts'
 export type { WorkflowSnapshot } from './workflow-view.ts'
@@ -48,13 +50,13 @@ export interface WorkflowCommit {
 
 export class WorkflowJournalError extends Error {
   override name = 'WorkflowJournalError'
-  constructor(readonly code: 'invalid' | 'conflict' | 'closed' | 'recovery-required' | 'limit', message: string, options?: ErrorOptions) {
+  constructor(readonly code: 'invalid' | 'conflict' | 'closed' | 'recovery-required' | 'limit' | 'capacity', message: string, options?: ErrorOptions) {
     super(message, options)
   }
 }
 
-const MAX_EVENTS = 10_000
-const MAX_RECORD_BYTES = 16 * 1024 * 1024
+const MAX_EVENTS = JOURNAL_HARD_EVENTS
+const MAX_RECORD_BYTES = JOURNAL_HARD_BYTES
 
 function invalid(message: string): never { throw new WorkflowJournalError('invalid', message) }
 
@@ -123,9 +125,41 @@ function freeze<T>(value: T): T {
 
 interface Replay {
   readonly record: WorkflowJournalRecord
+  readonly bytes: number
   readonly runs: Map<string, WorkflowRunState>
   readonly activeRunId: string
   readonly preRunRecovery?: WorkflowRuntimeRecoveryState
+}
+
+// The official domain validates cold rows before the Journal materializes them.
+// Reuse ONLY an exact object that this module fully validated and
+// deeply froze; never key by root/revision/content or trust caller-frozen data.
+// Weak ownership keeps completed/replaced records collectible.
+const validatedReplays = new WeakMap<WorkflowJournalRecord, Replay>()
+
+function validatedBudgets(candidate: unknown, runs: ReadonlyMap<string, WorkflowRunState>, revision: number): RunBudgets | undefined {
+  const budgets = candidate === undefined ? undefined : runBudgetsSchema.parse(candidate)
+  if (budgets?.accounts.some(account => !runs.has(account.runId))) invalid('budget account belongs to an unknown run')
+  for (const account of budgets?.accounts ?? []) {
+    if (account.recovery?.closed && !runs.get(account.runId)?.outcome) invalid('closed budget has no terminal workflow record')
+    if (account.recovery?.requests.some(item => item.workflowRevision > revision)) invalid('budget request revision is ahead of the journal')
+  }
+  return budgets
+}
+
+/** Operational accounting cannot replace events or change their interpreted state. */
+function replayBudgetChange(base: Replay, candidate: RunBudgets): Replay {
+  if (!base.record.budgets) invalid('budget change requires an existing account')
+  const budgets = validatedBudgets(cloneJson(candidate), base.runs, base.record.revision)!
+  // All other own fields, their order and exact immutable values are shared.
+  // Derive the canonical UTF-8 byte delta, without rescanning unchanged history.
+  const bytes = base.bytes - Buffer.byteLength(JSON.stringify(base.record.budgets), 'utf8')
+    + Buffer.byteLength(JSON.stringify(budgets), 'utf8')
+  if (bytes > MAX_RECORD_BYTES) throw new WorkflowJournalError('limit', 'journal exceeds the 16 MiB v1 bound')
+  const record = freeze({ ...base.record, budgets })
+  const result: Replay = { ...base, record, bytes }
+  validatedReplays.set(record, result)
+  return result
 }
 
 function applyPreRunRecovery(current: WorkflowRuntimeRecoveryState | undefined,
@@ -163,6 +197,10 @@ function applyPreRunRecovery(current: WorkflowRuntimeRecoveryState | undefined,
 }
 
 function replay(candidate: unknown): Replay {
+  if (candidate !== null && typeof candidate === 'object') {
+    const known = validatedReplays.get(candidate as WorkflowJournalRecord)
+    if (known) return known
+  }
   const raw = object(cloneJson(candidate), ['schemaVersion', 'rootSessionId', 'revision', 'events', 'budgets'], 'journal record')
   if (raw.schemaVersion !== 1) invalid('unsupported journal schemaVersion')
   const rootSessionId = identifier(raw.rootSessionId, 'rootSessionId')
@@ -210,18 +248,21 @@ function replay(candidate: unknown): Replay {
     events.push(stored)
     lastTime = time
   }
-  const budgets = raw.budgets === undefined ? undefined : runBudgetsSchema.parse(raw.budgets)
-  if (budgets?.accounts.some(account => !runs.has(account.runId))) invalid('budget account belongs to an unknown run')
-  for (const account of budgets?.accounts ?? []) {
-    if (account.recovery?.closed && !runs.get(account.runId)?.outcome) invalid('closed budget has no terminal workflow record')
-    if (account.recovery?.requests.some(item => item.workflowRevision > revision)) invalid('budget request revision is ahead of the journal')
-  }
-  return {
-    record: freeze({ schemaVersion: 1, rootSessionId, revision, events, ...(budgets ? { budgets } : {}) }),
+  const budgets = validatedBudgets(raw.budgets, runs, revision)
+  const record = freeze({ schemaVersion: 1 as const, rootSessionId, revision, events, ...(budgets ? { budgets } : {}) })
+  const bytes = Buffer.byteLength(JSON.stringify(record), 'utf8')
+  if (bytes > MAX_RECORD_BYTES) throw new WorkflowJournalError('limit', 'journal exceeds the 16 MiB v1 bound')
+  const result: Replay = {
+    record,
+    bytes,
     runs,
     activeRunId,
     ...(preRunRecovery === undefined ? {} : { preRunRecovery }),
   }
+  // Register after every semantic, size and budget check has succeeded. The
+  // mutable input was cloned; only our detached frozen output gains this proof.
+  validatedReplays.set(record, result)
+  return result
 }
 
 /** Semantic validation at the official storage-domain cold-read boundary. */
@@ -234,9 +275,11 @@ export class WorkflowJournal {
   private readonly queues = new Map<string, Promise<void>>()
   private readonly cache = new WeakMap<WorkflowJournalRecord, Replay>()
   private readonly listeners = new Set<(snapshot: WorkflowSnapshot) => void | Promise<void>>()
+  private readonly faultListeners = new Set<() => void | Promise<void>>()
   private accepting = true
   private closed = false
   private fault: unknown
+  private faultKind?: 'storage-write' | 'time-accounting'
   private disposal?: Promise<void>
 
   constructor(private readonly table: WorkflowJournalTable, private readonly clock: () => number = Date.now,
@@ -252,6 +295,31 @@ export class WorkflowJournal {
     if (this.fault !== undefined) throw new WorkflowJournalError('recovery-required', 'workflow storage failed; reopen and verify before advancing', { cause: this.fault })
   }
 
+  /** Available even when the store cannot safely be replayed; contains no raw exception. */
+  readFault(): { readonly kind: 'storage-write' | 'time-accounting' } | undefined {
+    return this.faultKind ? { kind: this.faultKind } : undefined
+  }
+
+  onFault(listener: () => void | Promise<void>): () => void {
+    if (this.closed) throw new WorkflowJournalError('closed', 'workflow journal is closed')
+    this.faultListeners.add(listener)
+    if (this.faultKind) this.notifyFault(listener)
+    return () => { this.faultListeners.delete(listener) }
+  }
+
+  private notifyFault(listener: () => void | Promise<void>): void {
+    try { Promise.resolve(listener()).catch(error => this.observerFailed(error)) }
+    catch (error) { this.observerFailed(error) }
+  }
+
+  private fail(error: unknown, kind: 'storage-write' | 'time-accounting'): void {
+    if (this.faultKind) return
+    // Seal BEFORE notifying: cancellation callbacks cannot sneak in a write.
+    this.fault = error ?? new Error('unknown storage failure')
+    this.faultKind = kind
+    for (const listener of this.faultListeners) this.notifyFault(listener)
+  }
+
   private materialize(record: WorkflowJournalRecord): Replay {
     let cached = this.cache.get(record)
     if (cached === undefined) {
@@ -259,6 +327,15 @@ export class WorkflowJournal {
       this.cache.set(record, cached)
     }
     return cached
+  }
+
+  /** Also applies to old/unmetered runs and requirement ingress. Reads remain available. */
+  assertExecutionCapacity(rootSessionId: string): void {
+    this.assertReadable()
+    const record = this.table.get(identifier(rootSessionId, 'rootSessionId'))
+    if (record && journalCapacity(record.revision, this.materialize(record).bytes)) {
+      throw new WorkflowJournalError('capacity', JOURNAL_CAPACITY_MESSAGE)
+    }
   }
 
   readSnapshot(rootSessionId: string): WorkflowSnapshot {
@@ -270,7 +347,8 @@ export class WorkflowJournal {
       revision: 0, availability: 'absent', run: null, history: [], preRunRecovery: null,
     }
     if (record.rootSessionId !== rootSessionId) invalid('journal row binding is invalid')
-    const { runs, activeRunId, preRunRecovery } = this.materialize(record)
+    const { runs, activeRunId, preRunRecovery, bytes } = this.materialize(record)
+    const capacity = journalCapacity(record.revision, bytes)
     const history = [...runs.values()].map(run => ({
       runId: run.runId,
       title: run.created!.title,
@@ -279,6 +357,7 @@ export class WorkflowJournal {
     if (activeRunId === '') return workflowSnapshotSchema.parse({
       schemaVersion: 1, source: 'plugin-journal', rootSessionId, revision: record.revision,
       availability: 'absent', run: null, history,
+      ...(capacity ? { capacity } : {}),
       preRunRecovery: preRunRecovery ?? null,
     })
     const projected = projectWorkflowRun(runs.get(activeRunId)!)
@@ -288,7 +367,9 @@ export class WorkflowJournal {
       availability: 'ready', run: {
         ...projected,
         ...(budget ? { budget, needsUser: projected.needsUser || ((budget.blocked !== null || budget.recovery?.awaitingResume) && !budget.recovery?.closed && !projected.manualClose) } : {}),
+        ...(capacity ? { needsUser: true } : {}),
       },
+      ...(capacity ? { capacity } : {}),
       ...(record.budgets ? { budgetRevision: record.budgets.revision } : {}),
       history,
       preRunRecovery: preRunRecovery ?? null,
@@ -342,6 +423,7 @@ export class WorkflowJournal {
         this.assertReadable()
         const current = this.table.get(rootSessionId)
         if (!current || this.materialize(current).activeRunId !== runId) invalid('budget admission requires the current run')
+        this.assertExecutionCapacity(rootSessionId)
         const account = current.budgets?.accounts.find(item => item.runId === runId)
         // Historical runs are left unmodified and explicitly unmetered. No
         // invented usage or retroactive claim that an old call was protected.
@@ -354,10 +436,10 @@ export class WorkflowJournal {
         else if (resource === 'command') updated.used.commands++
         else if (resource === 'root-model') updated.used.rootModel++
         else updated.used.childModel++
-        const next = replay({ ...current, budgets: {
+        const next = replayBudgetChange(this.materialize(current), {
           revision: current.budgets!.revision + 1,
           accounts: current.budgets!.accounts.map(item => item.runId === runId ? updated : item),
-        } })
+        })
         await this.persist(rootSessionId, next)
         if (exhausted) throw new RunBudgetExceeded()
       })
@@ -370,7 +452,8 @@ export class WorkflowJournal {
 
   /** Accounting and any terminal workflow events share ONE serialized durable put. */
   private changeBudget(rootSessionId: string, runId: string, expectedRevision: number | undefined,
-    change: (account: ReturnType<typeof mutableBudget>, state: WorkflowRunState) => readonly WorkflowEventData[]): Promise<WorkflowSnapshot> {
+    change: (account: ReturnType<typeof mutableBudget>, state: WorkflowRunState) => readonly WorkflowEventData[],
+    settlementOnly = false): Promise<WorkflowSnapshot> {
     try {
       this.assertReadable()
       if (!this.accepting) throw new WorkflowJournalError('closed', 'workflow journal is draining')
@@ -380,6 +463,7 @@ export class WorkflowJournal {
         this.assertReadable()
         const current = this.table.get(rootSessionId)
         if (!current || this.materialize(current).activeRunId !== runId) invalid('budget change requires the current run')
+        if (!settlementOnly) this.assertExecutionCapacity(rootSessionId)
         if (expectedRevision !== undefined && current.revision !== expectedRevision) {
           throw new WorkflowJournalError('conflict', 'budget decision refers to a stale workflow revision')
         }
@@ -391,10 +475,11 @@ export class WorkflowJournal {
         const events = data.map((event, offset): WorkflowStoredEvent => ({
           type: WORKFLOW_SESSION_EVENT_TYPE, seq: current.revision + offset, time, data: event,
         }))
-        const next = replay({ ...current, revision: current.revision + events.length, events: [...current.events, ...events],
-          budgets: { revision: current.budgets!.revision + 1
+        const budgets = { revision: current.budgets!.revision + 1
             + account.recovery.blocks - (old.recovery?.blocks ?? (old.blocked ? 1 : 0)),
-            accounts: current.budgets!.accounts.map(item => item.runId === runId ? account : item) } })
+            accounts: current.budgets!.accounts.map(item => item.runId === runId ? account : item) }
+        const next = events.length ? replay({ ...current, revision: current.revision + events.length,
+          events: [...current.events, ...events], budgets }) : replayBudgetChange(this.materialize(current), budgets)
         return this.persist(rootSessionId, next)
       })
       const settled = result.then(() => {}, () => {})
@@ -432,7 +517,7 @@ export class WorkflowJournal {
         account.recovery.blocks++
       }
       return []
-    })
+    }, reserve === 0)
   }
 
   /** Never count Host downtime. Only the previously granted unclosed slice is uncertain. */
@@ -448,11 +533,11 @@ export class WorkflowJournal {
         account.recovery.blocks++
       }
       return []
-    })
+    }, true)
   }
 
   /** A missed durable renewal is a storage safety failure, NOT budget exhaustion. */
-  sealTimeAccounting(error: Error): void { this.fault ??= error }
+  sealTimeAccounting(error: Error): void { this.fail(error, 'time-accounting') }
 
   consumeBudgetControl(rootSessionId: string, runId: string): Promise<WorkflowSnapshot> {
     return this.changeBudget(rootSessionId, runId, undefined, account => {
@@ -530,13 +615,13 @@ export class WorkflowJournal {
       request.settledAt = Math.max(request.createdAt, integer(this.clock(), 0, 'clock'))
       if (decision !== 'cancelled') request.decisionAudit = { authority: 'user', channel: 'native-question', operator: 'unverified', requestId: id }
       return events
-    })
+    }, decision !== 'approved')
   }
 
   private async persist(rootSessionId: string, next: Replay): Promise<WorkflowSnapshot> {
     try { await this.table.put(rootSessionId, next.record) }
     catch (error) {
-      this.fault = error ?? new Error('unknown storage failure')
+      this.fail(error, 'storage-write')
       throw new WorkflowJournalError('recovery-required', 'journal commit failed; reopen storage before retrying', { cause: error })
     }
     this.cache.set(next.record, next)
@@ -556,6 +641,9 @@ export class WorkflowJournal {
       const rootSessionId = identifier(raw.rootSessionId, 'rootSessionId')
       const expectedRevision = integer(raw.expectedRevision, 0, 'expectedRevision')
       if (!Array.isArray(raw.events) || raw.events.length === 0) invalid('commit requires at least one event')
+      if (raw.events.length > JOURNAL_BATCH_EVENTS || Buffer.byteLength(JSON.stringify(raw), 'utf8') > JOURNAL_BATCH_BYTES) {
+        throw new WorkflowJournalError('limit', '单次日志提交过大；请缩小本次操作，历史没有截断，也未放行新执行')
+      }
       const data = raw.events.map(event => parseWorkflowEventData(event))
       const limits = raw.runBudgetLimits === undefined ? undefined : runBudgetLimitsSchema.parse(raw.runBudgetLimits)
       const creations = data.filter(event => event.name === 'run/created')
@@ -566,6 +654,7 @@ export class WorkflowJournal {
         const current = this.table.get(rootSessionId)
         const actual = current?.revision ?? 0
         if (actual !== expectedRevision) throw new WorkflowJournalError('conflict', `expected journal revision ${expectedRevision}, actual ${actual}`)
+        if (!data.every(capacitySettlement)) this.assertExecutionCapacity(rootSessionId)
         let time = current?.events.at(-1)?.time ?? 0
         const additions = data.map((event, offset): WorkflowStoredEvent => {
           time = Math.max(time, integer(this.clock(), 0, 'clock'))
@@ -594,6 +683,7 @@ export class WorkflowJournal {
     this.disposal = Promise.all([...this.queues.values()]).then(() => {
       this.closed = true
       this.listeners.clear()
+      this.faultListeners.clear()
     })
     return this.disposal
   }

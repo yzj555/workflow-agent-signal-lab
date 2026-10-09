@@ -1,9 +1,72 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { lstat, mkdir, open, readFile, realpath, rename, unlink } from 'node:fs/promises'
+import { lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import type { ArtifactRecord } from '../workflow-contract.ts'
 import type { WorkflowFileState } from '../workflow-events.ts'
 import { normalizeProjectRelative } from '../workflow-project-contract.ts'
+
+const MAX_WORKSPACE_FILE_BYTES = 16 * 1024 * 1024
+
+/** A file growing after stat must not turn a bounded capture into an unbounded read. */
+async function readBoundedFile(target: string, maxBytes: number): Promise<Buffer> {
+  const file = await open(target, 'r')
+  try {
+    const stat = await file.stat()
+    if (!stat.isFile() || stat.size > maxBytes) throw new Error(`stored file exceeds its ${String(maxBytes)}-byte limit or is not regular`)
+    const chunks: Buffer[] = []
+    let bytes = 0
+    for (;;) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - bytes))
+      const { bytesRead } = await file.read(chunk, 0, chunk.length, null)
+      if (bytesRead === 0) break
+      bytes += bytesRead
+      if (bytes > maxBytes) throw new Error(`stored file grew beyond its ${String(maxBytes)}-byte limit`)
+      chunks.push(chunk.subarray(0, bytesRead))
+    }
+    return Buffer.concat(chunks, bytes)
+  } finally { await file.close() }
+}
+
+/**
+ * Preflight the pinned DSH 0.1.5-rc.1 UTF-8 write/edit semantics. This only
+ * denies oversized requests; the native tool still owns observation, CAS,
+ * sandbox policy and the actual mutation. Native-provider parity is tested.
+ */
+export function assertWorkspaceMutationSize(name: 'write' | 'edit', args: unknown, current: WorkspaceFileCapture): void {
+  const limit = () => new Error('文件写入结果超过 16 MiB 上限；未调用写入工具，请缩小本次变更')
+  if (name === 'write') {
+    const { content } = args as { content: string }
+    if (Buffer.byteLength(content, 'utf8') > MAX_WORKSPACE_FILE_BYTES) throw limit()
+    return
+  }
+  const value = args as { old_string: string; new_string: string; replace_all?: boolean }
+  if (value.replace_all !== undefined && typeof value.replace_all !== 'boolean') throw new Error('replace_all 必须为布尔值')
+  if (current.content === undefined) throw new Error('edit 需要已存在的 UTF-8 文本文件')
+  if (current.content.includes(0)) throw new Error('edit 不支持包含 NUL 的二进制文件')
+  const raw = new TextDecoder('utf-8', { fatal: true }).decode(current.content)
+  const normalized = raw.replaceAll('\r\n', '\n')
+  const oldText = value.old_string.replaceAll('\r\n', '\n')
+  const newText = value.new_string.replaceAll('\r\n', '\n')
+  if (!oldText.length || value.old_string === value.new_string) throw new Error('edit 需要非空且不同的替换文本')
+  let matches = 0, cursor = 0
+  for (;;) {
+    const index = normalized.indexOf(oldText, cursor)
+    if (index < 0) break
+    matches++
+    cursor = index + oldText.length
+  }
+  if (!matches || (!value.replace_all && matches !== 1)) throw new Error('edit 文本未唯一匹配；多处替换需显式 replace_all')
+  // UTF-8 bytes cannot be fewer than UTF-16 units. Reject expansion before
+  // allocating it; no split/join array proportional to the number of matches.
+  const units = normalized.length + matches * (newText.length - oldText.length)
+  if (!Number.isSafeInteger(units) || units > MAX_WORKSPACE_FILE_BYTES) throw limit()
+  let result = normalized.replaceAll(oldText, () => newText)
+  const sample = raw.slice(0, 4096)
+  const crlf = sample.split('\r\n').length - 1
+  const lf = sample.split('\n').length - 1 - crlf
+  if (crlf > lf) result = result.replaceAll('\r\n', '\n').replaceAll('\n', '\r\n')
+  if (Buffer.byteLength(result, 'utf8') > MAX_WORKSPACE_FILE_BYTES) throw limit()
+}
 
 /** Plugin-owned immutable text objects; never accepts a model-supplied path. */
 export class WorkflowTextArtifacts {
@@ -50,7 +113,7 @@ export class WorkflowTextArtifacts {
     const target = this.path(digest)
     const stat = await lstat(target)
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 128000) throw new Error('invalid stored artifact')
-    const text = await readFile(target, 'utf8')
+    const text = (await readBoundedFile(target, 128000)).toString('utf8')
     if (createHash('sha256').update(text, 'utf8').digest('hex') !== digest) throw new Error('stored artifact digest mismatch')
     return text
   }
@@ -62,7 +125,7 @@ export class WorkflowTextArtifacts {
 
   /** Content-addressed binary objects used only for pre-mutation workspace snapshots. */
   async putCheckpoint(bytes: Uint8Array): Promise<{ digest: string; bytes: number }> {
-    if (bytes.byteLength > 16 * 1024 * 1024) throw new Error('checkpoint file exceeds the 16 MiB pilot limit')
+    if (bytes.byteLength > MAX_WORKSPACE_FILE_BYTES) throw new Error('checkpoint file exceeds the 16 MiB pilot limit')
     const digest = createHash('sha256').update(bytes).digest('hex')
     const target = this.checkpointPath(digest)
     let file
@@ -81,8 +144,8 @@ export class WorkflowTextArtifacts {
   async readCheckpoint(digest: string): Promise<Uint8Array> {
     const target = this.checkpointPath(digest)
     const stat = await lstat(target)
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16 * 1024 * 1024) throw new Error('invalid stored checkpoint')
-    const bytes = await readFile(target)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_WORKSPACE_FILE_BYTES) throw new Error('invalid stored checkpoint')
+    const bytes = await readBoundedFile(target, MAX_WORKSPACE_FILE_BYTES)
     if (createHash('sha256').update(bytes).digest('hex') !== digest) throw new Error('stored checkpoint digest mismatch')
     return bytes
   }
@@ -152,8 +215,8 @@ export async function captureWorkspaceFileState(workspaceRoot: string, relativeP
     throw error
   }
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`workspace artifact is not a regular file: ${target.relativePath}`)
-  if (stat.size > 16 * 1024 * 1024) throw new Error(`workspace artifact exceeds the 16 MiB pilot limit: ${target.relativePath}`)
-  const content = await readFile(target.locator)
+  if (stat.size > MAX_WORKSPACE_FILE_BYTES) throw new Error(`workspace artifact exceeds the 16 MiB pilot limit: ${target.relativePath}`)
+  const content = await readBoundedFile(target.locator, MAX_WORKSPACE_FILE_BYTES)
   return {
     ...target,
     state: { kind: 'file', digest: createHash('sha256').update(content).digest('hex'), bytes: content.byteLength },

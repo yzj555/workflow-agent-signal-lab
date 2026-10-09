@@ -3,6 +3,7 @@ import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
 import { WORKFLOW_RPC_CHANNEL, workflowSnapshotRequestSchema, workflowSnapshotSchema } from '../workflow-view.ts'
 import { openWorkflowStorage } from './workflow-storage.ts'
 import type { WorkflowJournal } from '../workflow-journal.ts'
+import type { WorkflowOwner } from './workflow-owner.ts'
 
 export { openWorkflowStorage, workflowDomainSpec, WORKFLOW_DOMAIN_NAME } from './workflow-storage.ts'
 export { acquireWorkflowOwner } from './workflow-owner.ts'
@@ -32,7 +33,9 @@ export function workflowReadHandler(journal: WorkflowJournal, reportError: (erro
       return { ok: true, value: snapshot }
     } catch (error) {
       try { reportError(error) } catch { /* Keep a diagnostic sink out of the RPC outcome. */ }
-      return { ok: false, error: { code: 'internal', message: 'workflow state is unavailable; recovery must complete before advancing', details: {} } }
+      const fault = journal.readFault()
+      return { ok: false, error: { code: 'internal', message: 'workflow state is unavailable; recovery must complete before advancing',
+        details: fault ? { workflowFault: { schemaVersion: 1, rootSessionId: request.data.rootSessionId, kind: fault.kind } } : {} } }
     }
   }
 }
@@ -40,7 +43,10 @@ export function workflowReadHandler(journal: WorkflowJournal, reportError: (erro
 /** Host plugin: independently durable state plus a loopback-only read channel. */
 export async function apply(ctx: Context, config: WorkflowRuntimeConfig): Promise<void> {
   if (typeof config?.dataDirectory !== 'string') throw new Error('workflow runtime requires dataDirectory')
-  const runtime = await openWorkflowStorage(config.dataDirectory, error => ctx.logger.warn(String(error)))
+  const release = ctx.get('workflowReleaseReady') as { claimOwner?: () => WorkflowOwner } | undefined
+  // Distribution startup transfers the SAME CAS owner after checking existing
+  // data. No release/reacquire gap in which another Host could write a new image.
+  const runtime = await openWorkflowStorage(config.dataDirectory, error => ctx.logger.warn(String(error)), release?.claimOwner?.())
   let removeReadChannel: (() => Promise<void>) | undefined
   try {
     // DSH 0.1.5's dedicated-channel implementation resolves its Web route

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { WorkflowJournal } from '../workflow-journal.ts'
+import { WorkflowJournalError } from '../workflow-journal.ts'
 import { RUN_TIME_SLICE_MS, RunBudgetExceeded } from '../workflow-run-budget.ts'
 import type { ChildWatchdogScheduler } from './workflow-child-watchdog.ts'
 import { childScheduler } from './workflow-child-watchdog.ts'
@@ -39,7 +40,9 @@ export class WorkflowRunTime {
   }
   private fault(s: ClockRun, error: unknown): void {
     const reason = error instanceof Error ? error : new Error(String(error))
-    this.journal.sealTimeAccounting(reason)
+    const capacity = error instanceof WorkflowJournalError && (error.code === 'capacity'
+      || (error.code === 'limit' && this.journal.readSnapshot(s.rootId).capacity))
+    if (!capacity) this.journal.sealTimeAccounting(reason)
     this.notifyStop(s, reason)
     try { this.report(reason) } catch { /* observer cannot reopen admission */ }
   }

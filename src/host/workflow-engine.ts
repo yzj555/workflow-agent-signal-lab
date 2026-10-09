@@ -11,6 +11,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const journal = await ctx.plugin(JournalRuntime, config)
   try {
     const controller = await ctx.plugin(ControlRuntime, config)
+    try {
+      const release = ctx.get('workflowReleaseReady') as { verifyRuntime?: () => Promise<void> } | undefined
+      await release?.verifyRuntime?.()
+    } catch (error) {
+      await controller.dispose()
+      throw error
+    }
     ctx.effect(() => async () => {
       await controller.dispose()
       await journal.dispose()

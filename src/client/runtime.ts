@@ -1,7 +1,15 @@
 import { createElement as h, useCallback, useSyncExternalStore } from 'react'
+import type { Context } from '@deepseek-ai/cordis'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { UseSessions, UseSession, UseSessionStatus } from '@deepseek-ai/dsh-client-ui-session/client'
+import type { UseConversation } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry/types'
 import { WorkflowSurface, WorkflowStatus } from './workflow-surface.ts'
 import { workflowCss } from './workflow-styles.ts'
-import { bindWorkflowView, WORKFLOW_VIEW_ID } from './workflow-native-seats.ts'
+import { bindWorkflowView, nativeSubagentStatus, WORKFLOW_VIEW_ID } from './workflow-native-seats.ts'
 import { classifyWorkflowOutcome, summarizeAgentFollowup } from '../workflow-policy.ts'
 import { WorkflowSnapshotSource } from './workflow-source.ts'
 import { displayPreRunConversation, displayWorkflowState } from './workflow-display.ts'
@@ -103,6 +111,10 @@ interface SessionSummary {
       label?: string
       mode?: string
     } | null
+    subagentTiming?: {
+      lastTurnCompleted?: boolean
+      active?: { since: number; through: number }
+    }
   }
 }
 
@@ -121,13 +133,11 @@ interface SessionListState {
 
 interface WorkflowHeaderActionProps {
   source: WorkflowSnapshotSource
-  sessionId: string
-  useSessions: <T>(selector: (state: SessionListState) => T) => T
-  useSession: <T>(selector: (state: SessionLifecycleSnapshot) => T) => T
-  useConversation: <T>(selector: (state: ConversationAssemblySnapshot) => T) => T
-  useSessionPendingInteraction: <T>(
-    selector: (state: ReadonlyMap<string, PendingInteraction>) => T,
-  ) => T
+  sessionId: SessionId
+  useSessions: UseSessions
+  useSession: UseSession
+  useConversation: UseConversation
+  useSessionStatus: UseSessionStatus
 }
 
 interface StageDefinition {
@@ -138,6 +148,10 @@ interface StageDefinition {
 const ID = '@local/workflow-agent-signal-lab'
 const PRESET_ID = 'workflow-agent-signal-lab'
 const STYLE_ID = 'workflow-agent-runtime-style'
+
+// Host and Client share Cordis declaration merges in this dual-face project.
+// Use the public Client transport face instead of the Host connection handle.
+type WorkflowClientContext = Omit<Context, 'connection'> & { readonly connection: ConnectionHandle }
 
 const stages: readonly StageDefinition[] = [
   { name: '需求确认', purpose: '弄清目标、边界和成功条件' },
@@ -373,13 +387,14 @@ function subagentLines(
     const label = followup !== undefined && /^crew[-_]/iu.test(originalLabel)
       ? originalLabel.split(/\s+/u)[0] ?? originalLabel
       : originalLabel
-    const running = entry.activity === 'running' || summary?.running === true
     const continuable = (entry.mode ?? identity?.mode) === 'continuable'
+    const timing = summary?.projectionValues?.subagentTiming
+    const { status, tone } = nativeSubagentStatus({ running: summary?.running, activity: entry.activity,
+      mode: entry.mode ?? identity?.mode, lastTurnCompleted: timing?.lastTurnCompleted, openTurn: timing?.active !== undefined })
     return [{
       label,
       detail: followup ?? (summary?.title?.trim() || (continuable ? '可继续子 Agent' : '一次性子 Agent')),
-      status: running ? '运行中' : continuable ? '空闲' : '已完成',
-      tone: running ? 'active' : continuable ? 'waiting' : 'done',
+      status, tone,
     } satisfies AgentLine]
   })
 }
@@ -737,7 +752,7 @@ function useWorkflowState(source: WorkflowSnapshotSource, sessionId: string, ena
 }
 
 function useWorkflowProjection({
-  sessionId, useSessions, useSession, useConversation, useSessionPendingInteraction, source,
+  sessionId, useSessions, useSession, useConversation, useSessionStatus, source,
 }: WorkflowHeaderActionProps) {
   const preset = useSessions(state => {
     const value = state.byId[sessionId]?.projectionValues?.agentPreset
@@ -745,16 +760,22 @@ function useWorkflowProjection({
   })
   const authoritativeRunning = useSessions(state => state.byId[sessionId]?.running)
   const sessionSummaries = useSessions(state => state.byId)
-  const subagentCatalogs = useSessions(state => state.subagentsByParent)
+  const subagentCatalogs = useSessions(state => Object.fromEntries(Object.entries(state.byId)
+    .map(([id, row]) => [id, { entries: (row.projectionValues?.subagentCatalog ?? [])
+      .map(entry => ({ ...entry, kind: 'child' })) }])))
   const session = useSession(state => state)
   const conversation = useConversation(state => state)
-  const pending = useSessionPendingInteraction(state => state.get(sessionId))
+  const pending = useSessionStatus(state => state.get(sessionId)?.pendingInteraction)
   const chat = conversation.views.get('chat')
   const state = useWorkflowState(source, sessionId, preset === PRESET_ID)
   const effectiveSession: ConversationSnapshot = {
     blank: session.blank,
     running: authoritativeRunning ?? session.running,
-    nodes: chat?.legacy.nodes ?? [],
+    nodes: (chat?.legacy.nodes ?? []).map(node => {
+      // Unknown native surfaces carry opaque data, not a trusted Workflow run.
+      // Authoritative workflow phases come from the committed Journal below.
+      return 'data' in node ? { ...node, data: undefined } : node
+    }),
     partial: chat?.legacy.partial ?? null,
     runningCalls: chat?.legacy.runningCalls ?? [],
     pending: pending === undefined ? [] : [pending],
@@ -767,7 +788,7 @@ function useWorkflowProjection({
   const lastUserSeq = users.at(-1)?.seq ?? -1
   const assistant = assistantText(nodes.filter(node => node.kind === 'assistant').at(-1) ?? {})
   const partial = partialAssistantText(effectiveSession)
-  const projection = state.status === 'absent'
+  const projection = state.status === 'absent' && !state.snapshot?.capacity
     ? displayPreRunConversation({
       blank: effectiveSession.blank,
       hasUserGoal: users.length > 0,
@@ -794,9 +815,9 @@ function WorkflowHeaderStatus(props: WorkflowHeaderActionProps) {
   return h(WorkflowStatus, { projection, placement: 'header' })
 }
 
-export const inject = ['slots', 'connection', 'sessions']
+export const inject = ['slots', 'connection', 'sessions', 'uiSession']
 
-export function apply(ctx: any): void {
+export function apply(ctx: WorkflowClientContext): void {
   const source = new WorkflowSnapshotSource(ctx.connection.rpc)
   ctx.effect(() => {
     const generation = ctx.connection.generation
@@ -806,7 +827,7 @@ export function apply(ctx: any): void {
     return () => { unsubscribe(); source.dispose() }
   }, 'workflow-agent-runtime: committed snapshot source')
   ctx.effect(() => {
-    if (document.getElementById(STYLE_ID) !== null) return
+    if (document.getElementById(STYLE_ID) !== null) return () => {}
     const style = document.createElement('style')
     style.id = STYLE_ID
     style.dataset.plugin = ID
@@ -840,7 +861,7 @@ export function apply(ctx: any): void {
     id: WORKFLOW_VIEW_ID,
     order: 20,
     label: '工作流',
-  }, (props: Omit<WorkflowHeaderActionProps, 'source'>) => h(WorkflowView, { ...props, source }))))
+  }, (props: Omit<WorkflowHeaderActionProps, 'source'>) => h(WorkflowView, { ...props, source })), ctx.uiSession.adapter.current))
 
   ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
     name: 'conversation.session.header.actions',

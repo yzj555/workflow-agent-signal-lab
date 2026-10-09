@@ -1,9 +1,11 @@
 import { WORKFLOW_STAGES } from '../workflow-contract.ts'
 import type { WorkflowClientState } from './workflow-source.ts'
 import type { WorkflowRunView, WorkflowSnapshot } from '../workflow-view.ts'
+import { workflowFailedRoles } from '../workflow-view.ts'
 import { PROJECT_PILOT } from '../workflow-profiles.ts'
 import { stagePresentations, workflowHasPendingLearning } from './workflow-stage-display.ts'
 import { RUN_BUDGET_STOP_MESSAGE, runTimeSummary } from '../workflow-run-budget.ts'
+import { JOURNAL_CAPACITY_MESSAGE } from '../workflow-journal-capacity.ts'
 import type { StagePresentation, StageState } from './workflow-stage-display.ts'
 
 export type StageTone = 'active' | 'gate' | 'return' | 'done'
@@ -272,7 +274,23 @@ function childRuntimeDisplay(run: WorkflowRunView, active: number): Partial<Work
     needsUser: true, next: '在原生确认中决定，状态变化后必须重新核对。',
   }
   const affected = run.agents.filter(agent => agent.runtimeIssue && (run.outcome === null || agent.runtimeIssue.status !== 'stopped'))
-  if (!affected.length) return {}
+  if (!affected.length) {
+    const failedRoles = workflowFailedRoles(run)
+    if (!failedRoles.length || run.budget?.blocked) return {}
+    const roles = [...new Set(failedRoles.map(agent => roleLabels[agent.role] ?? agent.role))].join('、')
+    return {
+      now: `${roles} Agent 未正常完成 · 需要处理`, badge: '角色执行异常', tone: 'return',
+      nowDetail: failedRoles.length === 1 ? failedRoles[0]!.lastSummary ?? '没有有效的角色报告。'
+        : `${String(failedRoles.length)} 个角色未正常完成；逐项记录见下方 Agent 列表。`,
+      summary: '角色调用或报告闭环异常，不等于业务验收失败；未据此消耗返工次数，也不会自动重试或派发替代 Agent。',
+      live: active > 0 ? `日志中另有 ${String(active)} 个已授权 Agent 在运行；尚未接入进程存活核对。`
+        : '日志中没有运行态 Agent；这不是任意外部进程都已退出的证明。',
+      attentionTitle: '需要决定如何处理本轮异常', needsUser: true,
+      attentionDetail: '先查看原生对话中的调用错误和角色记录。需要重做时，先停止本轮，再重新确认需求；不会把继续聊天视为重跑授权。',
+      next: '在原生输入框说明处理决定；保留已有文件和证据，停止本轮并重新确认后才能新建运行。',
+      nextDetail: undefined, completionNotice: undefined,
+    }
+  }
   const unknown = affected.some(agent => agent.runtimeIssue!.status === 'unknown')
   const stopping = affected.some(agent => agent.runtimeIssue!.status === 'stopping')
   const status = unknown ? '未确认停止' : stopping ? '正在停止' : '已停止 · 需要处理'
@@ -297,6 +315,41 @@ function childRuntimeDisplay(run: WorkflowRunView, active: number): Partial<Work
 export function displayWorkflowState(state: WorkflowClientState, nativeAgents: readonly AgentLine[],
   stages: readonly { name: string; purpose: string }[]): WorkflowProjection {
   const snapshot = state.snapshot
+  if (state.status === 'unavailable' && state.fault) return {
+    stageIndex: -1, stageName: '存储待恢复', stagePurpose: '先恢复可信的持久状态，再核对执行范围',
+    title: '工作流持久状态无法确认', badge: '存储待恢复', now: '已封闭新执行 · 后台退出未确认',
+    summary: state.fault.kind === 'time-accounting' ? '计时凭据无法可靠结算；不是正常预算耗尽。'
+      : '工作流记录写入失败；本次提交可能未保存，也可能已保存但未获确认。',
+    live: 'Host 已请求停止其持有的工作流执行；不能据此认定后台已退出。',
+    attentionTitle: '需要恢复核对', attentionDetail: '状态不可读期间不能确认停止、取消或通过；旧授权与旧画面不作为继续执行依据。',
+    needsUser: true, next: '先保留现场和备份，排查存储故障；待可信读取恢复后核对原生会话、后台执行和文件，再决定后续。',
+    nextDetail: '不要反复重试、删除日志或锁、覆盖备份，或通过新会话绕过故障；本面板不会自动重启或修复存储。',
+    source: 'Host 持久化故障通知 · 未读取受影响日志', tone: 'return', uncertain: true, agents: [],
+    emptyAgentText: '无法可靠读取角色记录；空列表不代表没有后台工作。', stageStates: stages.map(() => 'unavailable'),
+  }
+  if ((state.status === 'ready' || state.status === 'absent') && snapshot?.capacity) {
+    // Overlay the real record, not a synthetic terminal outcome or exit acknowledgement.
+    const base = displayWorkflowState({ ...state, snapshot: { ...snapshot, capacity: undefined } }, nativeAgents, stages)
+    const agents = snapshot.run?.agents.map(agent => ({
+      label: `${roleLabels[agent.role] ?? agent.role} · ${agent.agentSessionId}`,
+      detail: agent.runtimeIssue?.reason ?? agent.lastSummary ?? agent.taskTitle,
+      ...agentPresentation(agent, snapshot.run!),
+      ...(agent.status === 'running' && !agent.runtimeIssue ? { status: '退出待核对', tone: 'waiting' as const } : {}),
+    })) ?? []
+    const stageDetails = base.stageDetails?.map(item => ['current', 'waiting'].includes(item.state)
+      ? { state: 'blocked' as const, label: '容量暂停', reason: JOURNAL_CAPACITY_MESSAGE } : item)
+    return { ...base, badge: '容量暂停', now: '日志容量已达上限 · 新执行已封闭',
+      nowDetail: `${snapshot.capacity.events} 条事件 · ${(snapshot.capacity.bytes / 1024 / 1024).toFixed(2)} MiB；剩余空间只用于停止与退出记录。`,
+      summary: JOURNAL_CAPACITY_MESSAGE, tone: 'gate', needsUser: true, uncertain: false, agents,
+      live: '容量拦截不是验收失败，也不是后台已停止；逐项退出状态保留在下方。',
+      attentionTitle: '需要核对后台停止', attentionDetail: JOURNAL_CAPACITY_MESSAGE,
+      next: '在原生输入框输入 /workflow-capacity 核对；需要停止时用 /workflow-capacity stop，不调用模型。',
+      nextDetail: '核对退出及未完成撤销后，再新建会话重新确认需求；不删除旧记录，不继承旧授权。',
+      completionNotice: snapshot.run?.outcome ? `原结论：${outcomes[snapshot.run.outcome]}；日志容量暂停不改变验收事实。` : undefined,
+      emptyAgentText: '没有已记录的受控角色；不能据此证明其他后台活动已停止。',
+      ...(stageDetails ? { stageDetails, stageStates: stageDetails.map(item => item.state) } : {}),
+    }
+  }
   if (state.status !== 'ready' || snapshot?.run === null || snapshot === null) {
     const absent = state.status === 'absent'
     return {

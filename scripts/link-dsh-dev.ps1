@@ -1,8 +1,13 @@
-param([Parameter(Mandatory = $true)][string]$DshSourceRoot)
+param([Parameter(Mandatory = $true)][string]$DshSourceRoot, [switch]$CheckOnly)
 
 $ErrorActionPreference = 'Stop'
 $labRoot = Split-Path -Parent $PSScriptRoot
 $dshRoot = (Resolve-Path -LiteralPath $DshSourceRoot).Path
+$labManifest = Get-Content -Raw -LiteralPath (Join-Path $labRoot 'package.json') | ConvertFrom-Json
+$hostManifest = Get-Content -Raw -LiteralPath (Join-Path $dshRoot 'apps/cli/package.json') | ConvertFrom-Json
+if ($hostManifest.name -ne '@deepseek-ai/dsh' -or $hostManifest.version -ne '0.2.0-rc.2') {
+    throw 'Development links require the reviewed DSH 0.2.0-rc.2 source baseline.'
+}
 $links = [ordered]@{
     '@deepseek-ai/cordis' = Join-Path $dshRoot 'vendor/cordis'
     '@deepseek-ai/cordis-plugin-loader' = Join-Path $dshRoot 'vendor/loader'
@@ -27,7 +32,10 @@ $links = [ordered]@{
     '@deepseek-ai/dsh-session-persistence' = Join-Path $dshRoot 'packages/session/session-persistence'
     '@deepseek-ai/dsh-session-query' = Join-Path $dshRoot 'packages/session-query/session-query'
     '@deepseek-ai/dsh-agent' = Join-Path $dshRoot 'packages/core/agent'
-    '@deepseek-ai/dsh-agent-presets' = Join-Path $dshRoot 'packages/preset/agent-presets'
+    '@deepseek-ai/dsh-agent-preset-registry' = Join-Path $dshRoot 'packages/preset/agent-preset-registry'
+    '@deepseek-ai/dsh-agent-preset' = Join-Path $dshRoot 'packages/preset/agent-preset'
+    '@deepseek-ai/dsh-app-boot' = Join-Path $dshRoot 'packages/boot/app-boot'
+    '@deepseek-ai/cordis-plugin-include' = Join-Path $dshRoot 'vendor/include'
     '@deepseek-ai/dsh-subagent' = Join-Path $dshRoot 'packages/subagent/subagent'
     '@deepseek-ai/dsh-subagent-spawn-in-process' = Join-Path $dshRoot 'packages/subagent/subagent-spawn-in-process'
     '@deepseek-ai/dsh-tool-subagent-control' = Join-Path $dshRoot 'packages/subagent/tool-subagent-control'
@@ -40,6 +48,7 @@ $links = [ordered]@{
     '@deepseek-ai/dsh-tool-pwsh' = Join-Path $dshRoot 'packages/shell/tool-pwsh'
     '@deepseek-ai/dsh-subprocess' = Join-Path $dshRoot 'packages/subprocess/subprocess'
     # Test-only concrete providers; production continues to use the Host's existing providers.
+    '@deepseek-ai/dsh-fs-local' = Join-Path $dshRoot 'packages/fs/fs-local'
     '@deepseek-ai/dsh-subprocess-local' = Join-Path $dshRoot 'packages/subprocess/subprocess-local'
     '@deepseek-ai/dsh-pwsh-sandbox' = Join-Path $dshRoot 'packages/shell/pwsh-sandbox'
     '@deepseek-ai/dsh-agent-loop' = Join-Path $dshRoot 'packages/core/agent-loop'
@@ -58,18 +67,38 @@ $links = [ordered]@{
     '@local/workflow-agent-signal-lab' = $labRoot
 }
 
+# Complete read-only preflight before the first link is created. A partial
+# source build or an unrelated existing dependency must not leave half a plan.
+$plannedLinks = @()
 foreach ($entry in $links.GetEnumerator()) {
     $target = (Resolve-Path -LiteralPath $entry.Value).Path
     $link = Join-Path $labRoot ('node_modules/' + $entry.Key)
+    $metadata = Get-Content -Raw -LiteralPath (Join-Path $target 'package.json') | ConvertFrom-Json
+    if ($metadata.name -ne $entry.Key) { throw "Source package identity mismatch: $($entry.Key)" }
+    $expected = $labManifest.peerDependencies.($entry.Key)
+    if (-not $expected) { $expected = $labManifest.devDependencies.($entry.Key) }
+    if (-not $expected) { $expected = $labManifest.dependencies.($entry.Key) }
+    if ($entry.Key.StartsWith('@deepseek-ai/') -and $metadata.version -ne $expected) {
+        throw "Source package version mismatch: $($entry.Key); expected $expected"
+    }
     if (Test-Path -LiteralPath $link) {
         # Never replace a user's installed dependency or a different link.
         $existing = Get-Item -LiteralPath $link
         if ($existing.LinkType -ne 'Junction' -or $existing.Target -ne $target) {
             throw "Existing dependency must be checked manually: $link"
         }
-        continue
+        $plannedLinks += [pscustomobject]@{ Link = $link; Target = $target; Exists = $true }
+    } else {
+        $plannedLinks += [pscustomobject]@{ Link = $link; Target = $target; Exists = $false }
     }
-    New-Item -ItemType Directory -Path (Split-Path -Parent $link) -Force | Out-Null
-    New-Item -ItemType Junction -Path $link -Target $target | Out-Null
+}
+if ($CheckOnly) {
+    Write-Output ('Checked ' + $plannedLinks.Count + ' development dependencies; no links were created or changed.')
+    return
+}
+foreach ($plan in $plannedLinks) {
+    if ($plan.Exists) { continue }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $plan.Link) -Force | Out-Null
+    New-Item -ItemType Junction -Path $plan.Link -Target $plan.Target | Out-Null
 }
 Write-Output ('Linked ' + $links.Count + ' development dependencies; DSH source was not modified.')

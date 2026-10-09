@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import { RootSessionDurability } from './workflow-session-durability.ts'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type {} from '@deepseek-ai/dsh-agent-presets'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import type {} from '@deepseek-ai/dsh-subagent'
 import type {} from '@deepseek-ai/dsh-user-questions'
 import { SessionId } from '@deepseek-ai/dsh-session'
@@ -28,6 +28,8 @@ import type { CommandRuntimeConfig } from './workflow-command-runtime.ts'
 import { WorkflowQuestionWaits } from './workflow-question-wait.ts'
 import { installWorkflowModelBudget } from './workflow-model-budget.ts'
 import type { RunBudgetConfig } from '../workflow-run-budget.ts'
+import type { HostAdmissionConfig } from './workflow-host-admission.ts'
+export { WorkflowHostAdmission, HostAdmissionFull, collectHostRoleClaims, hostRoleKey, resolveHostAdmissionConfig } from './workflow-host-admission.ts'
 export * from '../workflow-run-budget.ts'
 export { installWorkflowModelBudget } from './workflow-model-budget.ts'
 export { WorkflowQuestionWaits } from './workflow-question-wait.ts'
@@ -60,9 +62,15 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'workflow-control': { kind: 'workflow-control'; form: 'notice'; summary: string }
+  }
+}
+
 export const name = 'workflow-control'
 export const inject = ['workflowJournal', 'agents', 'agentPresets', 'subagents', 'sessionQuery', 'tools', 'userQuestions', 'systemPrompt', 'sessionPersistence']
-export interface Config extends Partial<RootTurnWatchdogConfig>, Partial<ChildWatchdogConfig>, Partial<CommandRuntimeConfig>, Partial<RunBudgetConfig> { dataDirectory: string }
+export interface Config extends Partial<RootTurnWatchdogConfig>, Partial<ChildWatchdogConfig>, Partial<CommandRuntimeConfig>, Partial<RunBudgetConfig>, Partial<HostAdmissionConfig> { dataDirectory: string }
 
 const ROLE_NAMES: Readonly<Record<string, string>> = {
   architect: '架构评估', engineer: '实现', test_engineer: '工程测试',
@@ -202,7 +210,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     isLive: agent => ctx.agents.get(agent.id) === agent,
     ensureRootDurable: (agent, signal) => rootDurability.ensure(agent, signal),
     isAwaitingUser: agent => nativeQuestions.has(agent),
-    cancelRoot: agent => agent.cancel({ kind: 'hook', reason: 'workflow-run-budget-closed' }, { keepInbox: true }),
+    cancelRoot: (agent, reason = 'run-budget') => agent.cancel({ kind: 'hook', reason: `workflow-${reason}-closed` }, { keepInbox: true }),
     ask: (agent, questions, signal) => ctx.userQuestions.ask({ agent, questions: [...questions], signal }),
     async start(parent, childId, role, prompt, signal) {
       const provider = ctx.subagents.getProvider('spawn')
@@ -219,11 +227,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     },
     drain: (parent, childIds) => ctx.subagents.drainContinuableChildren(parent, childIds.map(SessionId)),
     notify(parent, summary) {
-      const message = createUserMessage({ content: [{ type: 'text', text: summary }], source: { kind: 'plugin', plugin: 'workflow-control', form: 'notice', summary: summary.slice(0, 120) } })
+      const message = createUserMessage({ content: [{ type: 'text', text: summary }], source: { kind: 'workflow-control', form: 'notice', summary: summary.slice(0, 120) } })
       if (parent.status === 'idle') parent.followup(message)
       else parent.steer(message)
     },
-  }, error => ctx.logger.warn(String(error)), childConfig, undefined, commandConfig, config)
+  }, error => ctx.logger.warn(String(error)), childConfig, undefined, commandConfig, config, config)
   await controller.recoverOrphanedLeases()
   const watchdog = new RootTurnWatchdog(controller, {
     cancel(agent) {
@@ -234,7 +242,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       agent.followup(createUserMessage({
         content: [{ type: 'text', text: prompt }],
         source: {
-          kind: 'plugin', plugin: 'workflow-control', form: 'notice',
+          kind: 'workflow-control', form: 'notice',
           summary: '根协调响应超时，按 Workflow Journal 自动恢复一次',
         },
       }))

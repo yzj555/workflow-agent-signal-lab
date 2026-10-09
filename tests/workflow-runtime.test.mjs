@@ -4,7 +4,6 @@ import { mkdtemp, readFile, writeFile, access } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { createRequire } from 'node:module'
 import { createServer, request as httpRequest } from 'node:http'
 import { once } from 'node:events'
 import { execFile, fork } from 'node:child_process'
@@ -14,14 +13,12 @@ import { Context } from '@deepseek-ai/cordis'
 import { HostConnectionService } from '@deepseek-ai/dsh-client-connection'
 import Sessions from '@deepseek-ai/dsh-session'
 import * as RuntimePlugin from '../lib/workflow-runtime.js'
-import { readWorkflowSnapshot } from '../lib/workflow-source.js'
+import { readWorkflowSnapshot, WorkflowSnapshotSource } from '../lib/workflow-source.js'
+import { displayWorkflowState } from '../lib/workflow-display.js'
 import { fixture } from './helpers/workflow-fixture.mjs'
+import { officialBrowserRpc } from './helpers/workflow-browser-connection.mjs'
 
 const { openWorkflowStorage, acquireWorkflowOwner } = RuntimePlugin
-const requireOfficial = createRequire(import.meta.url)
-// Test-only: execute the installed official browser caller, with an HTTP base override.
-const connectionRoot = dirname(requireOfficial.resolve('@deepseek-ai/dsh-client-connection'))
-const { createWebConnectionRpc } = await import(pathToFileURL(join(connectionRoot, 'types/client/rpc.js')).href)
 const executeFile = promisify(execFile)
 const childPath = fileURLToPath(new URL('./helpers/workflow-owner-child.mjs', import.meta.url))
 const options = { timeout: 15_000 }
@@ -169,7 +166,13 @@ async function httpRuntime(t) {
     server.closeAllConnections()
     await new Promise(resolve => server.close(resolve))
   })
-  const rpc = createWebConnectionRpc((input, init) => fetch(new URL(new URL(input).pathname, origin), init))
+  const rpc = await officialBrowserRpc((input, init) => {
+    // Match the native page's relative transport, without rewriting a foreign
+    // request into this carrier's trusted loopback origin.
+    const target = new URL(input, origin + '/')
+    assert.equal(target.origin, origin)
+    return fetch(target, init)
+  })
   return { ctx, directory, origin, rpc, routes }
 }
 
@@ -187,6 +190,36 @@ test('official Host+Client Connection round-trips a committed snapshot over real
   const forbidden = await rpc.call('/workflow-runtime', 'commit', { events: [f.approve()] })
   assert.equal(forbidden.ok, false)
   assert.equal(journal.readSnapshot(f.rootSessionId).revision, expected.revision)
+})
+
+test('official error envelope carries only scoped fault categories and removes the stale view after a real SQLite write failure', options, async t => {
+  const { ctx, rpc, directory } = await httpRuntime(t), f = fixture('fault-http-root')
+  const journal = ctx.get('workflowJournal')
+  await journal.commit({ rootSessionId: f.rootSessionId, expectedRevision: 0, events: f.initial() })
+  const source = new WorkflowSnapshotSource(rpc, { pollMs: 10, timeoutMs: 2000 })
+  t.after(() => source.dispose())
+  source.subscribe(f.rootSessionId, () => {})
+  const until = async check => {
+    for (let i = 0; i < 100; i++) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 10)) }
+    assert.fail('official fault projection did not arrive')
+  }
+  await until(() => source.getSnapshot(f.rootSessionId).status === 'ready')
+  assert.equal(source.getSnapshot(f.rootSessionId).snapshot.revision, 6)
+  const external = new DatabaseSync(join(directory, 'journal.sqlite'))
+  try {
+    external.exec('BEGIN IMMEDIATE')
+    await assert.rejects(journal.commit({ rootSessionId: f.rootSessionId, expectedRevision: 6, events: [f.approve()] }))
+  } finally { external.exec('ROLLBACK'); external.close() }
+  await until(() => source.getSnapshot(f.rootSessionId).fault?.kind === 'storage-write')
+  const state = source.getSnapshot(f.rootSessionId)
+  assert.equal(state.snapshot, null)
+  assert.equal(state.fault.rootSessionId, f.rootSessionId)
+  const view = displayWorkflowState(state, [], [{ name: '需求确认', purpose: '确认需求' }])
+  assert.equal(view.badge, '存储待恢复'); assert.equal(view.needsUser, true)
+  assert.doesNotMatch(JSON.stringify(state), /sqlite|journal\.sqlite|[A-Z]:[\\/]|database is locked/)
+  const envelope = await rpc.call('/workflow-runtime', 'snapshot', { schemaVersion: 1, rootSessionId: f.rootSessionId })
+  assert.deepEqual(envelope.error.details, { workflowFault: { schemaVersion: 1, rootSessionId: f.rootSessionId, kind: 'storage-write' } })
+  assert.equal((await rpc.call('/workflow-runtime', 'commit', {})).ok, false, 'fault handling does not add a write route')
 })
 
 test('read channel rejects cross-site requests through the official trust fence', options, async t => {

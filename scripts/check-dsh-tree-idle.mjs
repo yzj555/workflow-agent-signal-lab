@@ -69,6 +69,7 @@ try {
     })
     const latest = await rpc('session/list', { _request: {} })
     return { sessionCount: latest.items.length, exceptRoot: exceptRoot ?? null,
+      roots: latest.items.map(item => ({ id: item.sessionId, running: item.running === true })),
       running: latest.items.filter(item => item.running).map(item => ({ id: item.sessionId, title: item.projections?.values?.title })),
       active, diagnostics, failures, catalog, resident,
       residentDiagnostics: diagnostics.filter(item => resident.ids.includes(item.entry.id)),

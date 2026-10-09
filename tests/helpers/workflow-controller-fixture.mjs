@@ -59,7 +59,7 @@ export async function controllerFixture(t, options = {}) {
     notify(parent, summary) { notices.push({ root: parent.id, summary, snapshot: journal.readSnapshot(parent.id) }) },
   }
   controller = new WorkflowTextController(journal, artifacts, driver, options.reportError, options.childConfig, options.childClock,
-    options.commandConfig, { runBudgetEnabled: true, runBudgetScope: 'all', ...options.runBudgetConfig })
+    options.commandConfig, { runBudgetEnabled: true, runBudgetScope: 'all', ...options.runBudgetConfig }, options.hostAdmissionConfig)
   controller.bindRoot(root)
   t.after(async () => { await controller.close(); await journal.close() })
   const snapshot = () => journal.readSnapshot(root.id)

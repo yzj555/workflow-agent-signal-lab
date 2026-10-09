@@ -1,9 +1,16 @@
 import { z } from 'zod'
 import { runBudgetAccountSchema } from './workflow-run-budget.ts'
+import { journalCapacitySchema } from './workflow-journal-capacity.ts'
 import { WORKFLOW_ROLES, WORKFLOW_STAGES } from './workflow-contract.ts'
 import { WORKFLOW_EXECUTION_PROFILES } from './workflow-profiles.ts'
 
 export const WORKFLOW_RPC_CHANNEL = '/workflow-runtime'
+/** Only controlled categories cross the read channel; never exception text or paths. */
+export const workflowReadFaultSchema = z.strictObject({
+  schemaVersion: z.literal(1), rootSessionId: z.string().min(1).max(256),
+  kind: z.enum(['storage-write', 'time-accounting']),
+})
+export type WorkflowReadFault = z.infer<typeof workflowReadFaultSchema>
 export const workflowSnapshotRequestSchema = z.strictObject({
   schemaVersion: z.literal(1),
   rootSessionId: z.string().trim().min(1).max(256),
@@ -152,6 +159,8 @@ export const workflowSnapshotSchema = z.strictObject({
   schemaVersion: z.literal(1), source: z.literal('plugin-journal'), rootSessionId: z.string(),
   revision: z.int().nonnegative(), availability: z.enum(['ready', 'absent']),
   budgetRevision: z.int().nonnegative().optional(),
+  // Derived from durable bytes/events, never an inferred Agent exit or an approval.
+  capacity: journalCapacitySchema.optional(),
   run: runView.nullable(),
   history: z.array(z.strictObject({ runId: z.string(), title: z.string(), outcome: outcome.nullable() })),
   // Optional for clients reading snapshots produced before the pre-run
@@ -159,6 +168,9 @@ export const workflowSnapshotSchema = z.strictObject({
   // workflow run, a merged requirement, or a Signal Gate approval.
   preRunRecovery: runtimeRecoveryView.nullable().optional(),
 }).superRefine((value, context) => {
+  if (value.capacity && value.capacity.events !== value.revision) {
+    context.addIssue({ code: 'custom', message: 'journal capacity must match the snapshot revision' })
+  }
   if (value.run?.budget && (value.run.budget.runId !== value.run.runId || !value.budgetRevision)) {
     context.addIssue({ code: 'custom', message: 'budget must bind to the current run and its accounting revision' })
   }
@@ -177,3 +189,11 @@ export const workflowSnapshotSchema = z.strictObject({
 
 export type WorkflowSnapshot = z.infer<typeof workflowSnapshotSchema>
 export type WorkflowRunView = z.infer<typeof runView>
+
+/** Current failed roles only: historical assignments and business QA verdicts are not runtime failures. */
+export function workflowFailedRoles(run: Pick<WorkflowRunView, 'outcome' | 'tasks' | 'agents'>): WorkflowRunView['agents'] {
+  if (run.outcome !== null) return []
+  return run.agents.filter(agent => !agent.runtimeIssue && ['interrupted', 'failed'].includes(agent.status)
+    && run.tasks.some(task => task.taskId === agent.taskId && task.version === agent.taskVersion
+      && ['failed', 'invalidated'].includes(task.status)))
+}

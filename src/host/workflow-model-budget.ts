@@ -16,8 +16,11 @@ export function installWorkflowModelBudget(ctx: Context, agent: Agent, controlle
     if (options.purpose) { yield* next(); return }
     if (!isAgentLoopRequest(options) || !Object.isFrozen(options)) throw new Error('预算只接受官方 AgentLoop 冻结请求')
     options.signal?.throwIfAborted()
-    await controller.admitModelRequest(agent)
-    options.signal?.throwIfAborted()
-    yield* next()
+    const release = controller.beginHostModel(agent)
+    try {
+      await controller.admitModelRequest(agent)
+      options.signal?.throwIfAborted()
+      yield* next()
+    } finally { release() }
   }, { prepend: true })
 }

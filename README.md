@@ -4,29 +4,54 @@
 
 本仓库是工作流插件，不是 DSH 核心，也不是端口管理工具；端口工具只是早期测试任务。
 
+换设备接续请先阅读 [换机接续说明](docs/operations/device-handoff-2026-10-09.md)：源码与锁文件可从仓库恢复，原始实验档案、凭据和本机配置不在公开仓库中；当前仍是候选，不是正式生产版。
+
 ## 能力与当前状态
+
+2026-10-08：最终目标为正式 **Production v1**；当前在发布候选验证阶段，尚未完成生产准入。剩余工作与验收状态见 [Production v1 执行清单](docs/operations/production-v1-status.md)。
+
+新版兼容进展：固定 0.2.0-rc.2 的 **RC.12 已合回主工程，并从主工程复现两次干净构建各 588/588**；220 个输入、43 个载荷及归档与前序验收包完全一致。同包通过实际双 L1／四角色并行、命令第 41 次拒绝、120 秒超时、双 L0 各一次返工、模型第 241 次调用前拒绝及实际 30 分钟到限；7,010 次成功快照 RPC 和完整冷回放通过。新版七类恢复分支也已逐项绑定两轮的 28 个明确用例，不沿用旧 SDK 结论。模型与问答来自限定合成提供者，不当作独立真实使用；收尾计时超量和原生只读回放限制保留，不作毫秒级强杀或可写 UI 保证。此前原生准入、升级、保留新增数据的兼容回退和卸载重装通过，失败及缓存限制保留。旧主目录 `lib` 与开发链接未替换，生产接入及独立真实使用仍待完成，**不是生产准入通过**。见 [主工程整合与恢复证据](docs/validation/2026-10-08-dsh-020-canonical.md)、[同包文本与资源边界](docs/validation/2026-10-08-dsh-020-resource.md)、[维护与数据保留](docs/validation/2026-10-08-dsh-020-maintenance.md)和[原生准入](docs/validation/2026-10-08-dsh-020-installed-activation.md)。
+
+同一 RC.5 已通过隔离安装后的 L0/L1 原生运行、4 角色并行、模型／命令额度、120 秒命令超时及 30 分钟有效时长到限验证；6,988 次实际快照 RPC 和冷读一致。正式接入已选择独立生产 Profile、保留全部实验档案，但还没有创建或切换。现有 3080 在验证期间更换了进程，当前 Profile 绑定待核对；本工作区旧文件和 20 行记录未变，整批环境保护汇总为 needs-attention，不作上线批准。见 [本批验证与限制](docs/validation/2026-10-08-installed-runtime.md)。
+
+发布工程已有不依赖 DSH 开发目录的预构建 `.tgz` 候选。旧 SDK 的 RC.7 补齐可分发原生诊断采集，两次独立生产构建各 528/528，211 个输入、42 个载荷及归档一致；安装后实际采集与脱敏导出通过，运行时 lib 与 RC.5 一致。此前 RC.5 的首次配置、已有数据重配置、编号 RC 升级、受控启动拒绝、保留新增记录的代码回退和空闲停用已通过固定旧官方 Host 验收。全局 DSH 入口当前指向 0.2.0-rc.2 源码；RC.7 的固定基线为 0.1.5-rc.1，RC.8／RC.9 为 0.2.0-rc.2，不同基线的验收不能互相外推。当前 3080 未因此部署；生产 Profile 创建、实际接入、独立真实使用及正式交付未完成。采集未观察到活动不代表全 Host 空闲或获得重启许可。见 [旧基线采集验收](docs/validation/2026-10-08-native-capture.md)、[构建说明](docs/operations/release-build.md)和[已有数据维护](docs/operations/workflow-profile-transition.md)。
 
 - 需求澄清、合并确认、计划／执行授权；明确选择预设后遵循流程。
 - 协调、只读架构分析、实现、工程测试、代码审查、黑盒验收的角色与权限边界；固定串并行路径和有限返工。
 - 持久化 Journal、停止与未知退出区分、文件检查点、撤销中断恢复和逐项经验沉淀。
 - 原生聊天与问答；工作流页签只显示状态与证据，不提供第二个聊天窗口。
 
-状态为**受控内部 Alpha／本地有人看护的开发辅助**，不宣称无人值守生产执行。最新源码包含尚未在原本机 3080 激活的撤销恢复候选，干净构建后两轮 364/364 测试通过。公开托管不等于已经发布可直接安装的 npm 包。
+状态为**受控内部 Alpha／本地有人看护的开发辅助**，不宣称无人值守生产执行。撤销恢复版本已于 2026-09-20 经授权加载到本机 3080，12 项真实页面只读检查通过，20 条历史记录不变；对应源码的历史干净构建两轮 364/364 通过，本次激活没有重跑或增加这些测试。公开托管不等于已经发布可直接安装的 npm 包。
 
-主要文档：[基础使用与限制](docs/operations/basic-production-usage.md)、[生产准入清单](docs/design/workflow-production-readiness-v1.md)、[撤销恢复协议](docs/design/workflow-file-rollback-recovery-v2.md)、[公开验证摘要](docs/validation/2026-09-17.md)。
+同日后续只增补恢复测试：既定七类中断矩阵逐项通过，Gate B 关闭；专项 19/19、连续两轮全量 378/378，双端类型检查通过。没有再次重启或修改线上记录。Gate A/B 已有通过证据，C/D/E 仍待完成；见 [本次恢复验收](docs/validation/2026-09-20-gate-recovery.md)。
+
+当前最新源码另含**尚未激活的文件容量修正**：超限写入前置拒绝、检查点容量预检和有界读取。隔离候选两轮 391/391，20 条历史状态兼容；不代表当前 3080 已加载，Gate C 仍在补齐。见 [候选核验](docs/validation/2026-09-20-resource-guards.md)。开发验证新增官方 `dsh-fs-local` 测试依赖，需重新执行下方链接脚本；不替换生产文件提供者。
+
+其后的**日志容量候选也未激活**：9000 条事件或 14 MiB 时提前暂停新执行，预留停止与退出记录空间，并提供无需模型的原生核对入口。最终同一候选两轮 405/405（测试文件并发 4），双端类型检查、计时交叉探针和 20 条历史兼容检查通过；旧失败证据保留，不宣称 Gate C／生产版已经通过。见 [日志容量核验](docs/validation/2026-09-20-journal-capacity.md)。
+
+最新**故障处置候选仍未激活**：共享存储写入失败及时封闭执行、撤下旧可信快照；当前角色调用异常明确提示处理，不能作为业务验收失败或自动重跑。两轮 418/418、双端类型检查、真实隔离 SQLite／HTTP／PowerShell 验证和 20 条历史兼容通过。见 [故障核验与剩余边界](docs/validation/2026-09-20-storage-faults.md)。
+
+现已增加[只读诊断和脱敏导出](docs/operations/workflow-diagnostics.md)：新增 20 项测试，最终两轮 438/438，实际核对 20 行／26 个 run；关联目录告警、退出未知与历史文件差异如实保留，数据报告不是全绿。该增量未改变运行时构建或线上状态，完整 C/D/E 仍未通过；见 [验证记录](docs/validation/2026-09-20-diagnostics.md)。
+
+后续查明其中 24 项告警为 DSH 拒绝旧 v0／descriptor v2 原生历史，涉及 3 会话／8 个已有结局的运行；没有改写旧记录。新增 4 项兼容回归，两轮 442/442；Journal 可读不代表原生对话完整兼容，原 Profile 无损升级仍需单独处置。见 [原因与影响边界](docs/validation/2026-09-20-native-history.md)。
+
+记账性能候选已完成同输入两轮 450/450 及 30 分钟持续验证；随后 Host 并发候选完成两轮 466/466，整批准入、未知占位及新用户轮解封均有隔离证据。两批均**未激活**，旧基准不外推为新版本全链路长跑。见[资源候选](docs/operations/workflow-resource-policy.md)、[记账核验](docs/validation/2026-09-20-budget-performance.md)和[Host 准入核验](docs/validation/2026-09-20-host-admission.md)。
+
+主要文档：[基础使用与限制](docs/operations/basic-production-usage.md)、[生产准入清单](docs/design/workflow-production-readiness-v1.md)、[撤销恢复协议](docs/design/workflow-file-rollback-recovery-v2.md)、[候选验证摘要](docs/validation/2026-09-17.md)、[本次激活摘要](docs/validation/2026-09-20-activation.md)。
 
 ## 开发与验证
 
-当前核验环境为 Windows、Node.js 26.1.0、DSH `0.1.5-rc.1`（源码提交 `183f08e9c6dde7e36cd2318eaee70b0da08fb35e`）。需要先准备已安装依赖且已构建的匹配 DSH 源码，再链接开发依赖：
+当前主工程发行基线为 Windows、Node.js 26.1.0、DSH `0.2.0-rc.2`（官方源码提交 `639ed015397290b3745d163aafe02ffee4aa3f84`）；`0.1.5-rc.1` 的结果保留为历史。独立发行构建已经通过类型检查、构建及全量测试；主目录原有 `lib` 和开发链接尚未重建，不作为生产入口。开发者需要先准备已安装依赖且已构建的匹配 DSH 源码，在不供 Host 使用的副本中预检并链接：
 
 ```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\link-dsh-dev.ps1 -DshSourceRoot C:\path\to\deepseek-harness -CheckOnly
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\link-dsh-dev.ps1 -DshSourceRoot C:\path\to\deepseek-harness
 npm run typecheck
 npm run build
 npm test
 ```
 
-这是一条开发验证路径，不是独立安装包。`node_modules`、编译输出和 DSH 上游源码不进入此仓库；锁文件保留现有实验依赖记录，不将其宣称为已经验证的独立安装流程。
+这是一条开发验证路径，不是生产安装方式；不要在已运行的部署目录直接执行 build。独立发布构建使用上方另列的入口，不需要这个开发链接脚本。`node_modules`、编译输出和 DSH 上游源码不进入此仓库；现有锁文件与 `pnpm-workspace.yaml` 已验证用于干净候选构建。隔离 RC 升级／回退及 Web 启停已验收，正式版本与同基线生产接入仍待完成。
 
 接入本地 DSH 时参考 `cordis.patch.example.yml`，生成自己的 `cordis.patch.yml` 并填入私有绝对数据目录，随后按官方插件机制接入现有 Web Profile。不要覆盖已有配置、复制他人的凭据或直接运行历史激活脚本。示例没有修改设置／凭据路径，也不禁用其他插件。
 

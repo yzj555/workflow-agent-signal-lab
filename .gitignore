@@ -1,10 +1,12 @@
 # Public repository allow-list. Local operations/data are not publication inputs.
 /*
 !/.gitignore
+!/.gitattributes
 !/README.md
 !/CHANGELOG.md
 !/package.json
 !/pnpm-lock.yaml
+!/pnpm-workspace.yaml
 !/tsconfig.json
 !/tsconfig.base.json
 !/tsconfig.client.json
@@ -15,6 +17,8 @@
 !/preset/
 !/docs/
 !/scripts/
+!/release/
+!/tsdown.release.config.ts
 
 # Never publish runtime databases, sessions, credentials or machine configuration.
 **/.dsh/
