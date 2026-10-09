@@ -3,6 +3,7 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/PROJECT_GUIDE.md
 !/CHANGELOG.md
 !/package.json
 !/pnpm-lock.yaml
